@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSail Step Report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "performed",
+    "list_id",
+    "branch",
+    "project_status",
+    "exit_code",
+    "task",
+    "blocked_reason",
+    "next_ready_task",
+    "tasks_remaining",
+    "final_verification",
+    "experience_records",
+    "at"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {
+      "enum": [
+        "already-complete",
+        "blocked",
+        "resume",
+        "attempt",
+        "idle",
+        "final-verification"
+      ]
+    },
+    "performed": {"type": "boolean"},
+    "list_id": {"type": "string", "minLength": 1},
+    "branch": {"type": "string", "minLength": 1},
+    "project_status": {"enum": ["executing", "blocked", "complete"]},
+    "exit_code": {"enum": [0, 2, 3, 4]},
+    "task": {
+      "oneOf": [
+        {"$ref": "#/$defs/task"},
+        {"type": "null"}
+      ]
+    },
+    "blocked_reason": {"type": ["string", "null"]},
+    "next_ready_task": {
+      "oneOf": [
+        {"$ref": "#/$defs/next-ready-task"},
+        {"type": "null"}
+      ]
+    },
+    "tasks_remaining": {"type": "integer", "minimum": 0},
+    "final_verification": {
+      "oneOf": [
+        {"$ref": "#/$defs/final-verification"},
+        {"type": "null"}
+      ]
+    },
+    "experience_records": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "status",
+        "attempts",
+        "attempt",
+        "commit",
+        "failure",
+        "attempt_log",
+        "ai_retry_count",
+        "ai_retries_remaining"
+      ],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["pending", "running", "done", "blocked", "superseded"]
+        },
+        "attempts": {"type": "integer", "minimum": 0},
+        "attempt": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "commit": {"type": ["string", "null"]},
+        "failure": {"type": ["string", "null"]},
+        "attempt_log": {"type": ["string", "null"]},
+        "ai_retry_count": {"type": "integer", "minimum": 0},
+        "ai_retries_remaining": {"type": "integer", "minimum": 0, "maximum": 1}
+      }
+    },
+    "next-ready-task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1}
+      }
+    },
+    "final-verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "failure"],
+      "properties": {
+        "status": {"enum": ["passed", "failed"]},
+        "failure": {"type": ["string", "null"]}
+      }
+    }
+  }
+}

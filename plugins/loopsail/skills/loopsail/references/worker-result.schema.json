@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LoopSail Worker Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "task_id",
+    "status",
+    "summary",
+    "changed_files",
+    "verification_results",
+    "lessons",
+    "blocker"
+  ],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["completed", "blocked"]},
+    "summary": {"type": "string"},
+    "changed_files": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "verification_results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["argv", "exit_code"],
+        "properties": {
+          "argv": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1
+          },
+          "exit_code": {"type": ["integer", "null"]},
+          "summary": {"type": "string"}
+        }
+      }
+    },
+    "lessons": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "challenge",
+          "detour",
+          "root_cause",
+          "resolution",
+          "takeaway"
+        ],
+        "properties": {
+          "challenge": {"type": "string", "minLength": 1, "maxLength": 2000},
+          "detour": {
+            "oneOf": [
+              {"type": "string", "minLength": 1, "maxLength": 2000},
+              {"type": "null"}
+            ]
+          },
+          "root_cause": {
+            "oneOf": [
+              {"type": "string", "minLength": 1, "maxLength": 2000},
+              {"type": "null"}
+            ]
+          },
+          "resolution": {
+            "oneOf": [
+              {"type": "string", "minLength": 1, "maxLength": 2000},
+              {"type": "null"}
+            ]
+          },
+          "takeaway": {"type": "string", "minLength": 1, "maxLength": 2000}
+        }
+      }
+    },
+    "blocker": {"type": ["string", "null"]}
+  }
+}

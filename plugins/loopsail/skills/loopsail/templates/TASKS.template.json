@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "list_id": "TODO-list-id",
+  "project": "{{PROJECT_NAME}}",
+  "final_verify_commands": [],
+  "tasks": [
+    {
+      "id": "TODO-001",
+      "title": "TODO：任务标题",
+      "description": "TODO：描述要实现的行为、约束和必要背景",
+      "depends_on": [],
+      "context_files": [],
+      "allowed_paths": [],
+      "source_refs": [],
+      "acceptance": [],
+      "non_goals": [],
+      "stop_conditions": [],
+      "verify_commands": []
+    }
+  ]
+}
