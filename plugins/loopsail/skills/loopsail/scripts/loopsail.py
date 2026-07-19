@@ -195,6 +195,43 @@ def run_process(
     return result
 
 
+def claude_child_environment() -> dict[str, str]:
+    """Return an environment suitable for a nested Claude CLI process."""
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CLAUDECODE" and not key.startswith("CLAUDE_CODE_")
+    }
+
+
+def claude_launcher_argv(config: dict[str, Any], *args: str) -> list[str]:
+    return (
+        list(config["claude"]["command_prefix"])
+        + list(config["claude"]["extra_args"])
+        + list(args)
+    )
+
+
+def claude_launcher_overridden(config: dict[str, Any]) -> bool:
+    return config["claude"] != DEFAULT_CONFIG["claude"]
+
+
+def active_claude_profile() -> dict[str, str]:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if configured:
+        path = Path(configured).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        return {
+            "inherited_config_dir": str(path.resolve()),
+            "source": "CLAUDE_CONFIG_DIR",
+        }
+    return {
+        "inherited_config_dir": str((Path.home() / ".claude").resolve()),
+        "source": "default",
+    }
+
+
 def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return run_process(["git", *args], cwd=root, check=check)
 
@@ -1143,12 +1180,13 @@ def invoke_worker(
     prompt = worker_prompt(
         root, task_file, task, task_state["attempts"], task_state.get("last_failure")
     )
-    argv = list(config["claude"]["command_prefix"])
-    argv.extend(config["claude"]["extra_args"])
+    argv = claude_launcher_argv(config)
     argv.extend(
         [
             "-p",
             "--no-session-persistence",
+            "--strict-mcp-config",
+            "--disable-slash-commands",
             "--output-format",
             "json",
             "--json-schema",
@@ -1167,11 +1205,7 @@ def invoke_worker(
     if config["max_budget_usd"] is not None:
         insert_at = len(config["claude"]["command_prefix"]) + len(config["claude"]["extra_args"])
         argv[insert_at:insert_at] = ["--max-budget-usd", str(config["max_budget_usd"])]
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key != "CLAUDECODE" and not key.startswith("CLAUDE_CODE_")
-    }
+    env = claude_child_environment()
     env.update(
         {
             "LOOPSAIL_TOOL_DIR": str(TOOL_ROOT),
@@ -1917,7 +1951,9 @@ def command_validate(args: argparse.Namespace) -> int:
                 "list_id": task_list["list_id"],
                 "tasks": len(task_list["tasks"]),
                 "config_sources": sources,
-                "launcher_kind": "configured-prefix",
+                "launcher_kind": (
+                    "configured-prefix" if claude_launcher_overridden(config) else "active-profile"
+                ),
                 "worker_timeout_seconds": config["worker_timeout_seconds"],
             },
             ensure_ascii=False,
@@ -1930,15 +1966,65 @@ def command_validate(args: argparse.Namespace) -> int:
 def command_doctor(args: argparse.Namespace) -> int:
     root = maybe_discover_project_root() or Path.cwd().resolve()
     config, sources = load_config(root, args.runner_config)
-    argv = list(config["claude"]["command_prefix"]) + list(config["claude"]["extra_args"])
-    argv.append("--version")
-    result = run_process(argv, cwd=root, timeout=min(60, config["worker_timeout_seconds"]))
-    if result.returncode != 0:
-        raise LoopSailError(f"Claude launcher failed doctor check with exit code {result.returncode}")
-    version = (result.stdout.strip().splitlines() or result.stderr.strip().splitlines() or ["ok"])[-1]
+    timeout = min(60, config["worker_timeout_seconds"])
+    env = claude_child_environment()
+    version_result = run_process(
+        claude_launcher_argv(config, "--version"),
+        cwd=root,
+        timeout=timeout,
+        env=env,
+    )
+    if version_result.returncode != 0:
+        raise LoopSailError(
+            "Claude launcher failed version check with exit code "
+            f"{version_result.returncode}"
+        )
+    version = (
+        version_result.stdout.strip().splitlines()
+        or version_result.stderr.strip().splitlines()
+        or ["ok"]
+    )[-1]
+
+    auth_result = run_process(
+        claude_launcher_argv(config, "auth", "status", "--json"),
+        cwd=root,
+        timeout=timeout,
+        env=env,
+    )
+    if auth_result.returncode != 0:
+        raise LoopSailError(
+            "Claude launcher failed authentication check with exit code "
+            f"{auth_result.returncode}"
+        )
+    try:
+        auth = parse_json_tail(auth_result.stdout)
+    except LoopSailError as exc:
+        raise LoopSailError("Claude authentication status was not valid JSON") from exc
+    if auth.get("loggedIn") is not True:
+        raise LoopSailError("Claude launcher is not authenticated")
+    auth_method = auth.get("authMethod")
+    api_provider = auth.get("apiProvider")
+    if auth_method is not None and not isinstance(auth_method, str):
+        raise LoopSailError("Claude authentication method was invalid")
+    if api_provider is not None and not isinstance(api_provider, str):
+        raise LoopSailError("Claude API provider was invalid")
+
+    overridden = claude_launcher_overridden(config)
     print(
         json.dumps(
-            {"healthy": True, "config_sources": sources, "claude_version": version[-200:]},
+            {
+                "healthy": True,
+                "config_sources": sources,
+                "launcher_kind": "configured-prefix" if overridden else "active-profile",
+                "launcher_overridden": overridden,
+                "claude_profile": active_claude_profile(),
+                "claude_version": version[-200:],
+                "authentication": {
+                    "logged_in": True,
+                    "method": auth_method[:100] if auth_method is not None else None,
+                    "provider": api_provider[:100] if api_provider is not None else None,
+                },
+            },
             ensure_ascii=False,
             indent=2,
         )

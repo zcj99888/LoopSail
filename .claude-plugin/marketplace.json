@@ -9,7 +9,6 @@
     {
       "name": "loopsail",
       "description": "Runs structured development task lists through supervised Claude workers with validation, recovery, and guarded Git commits.",
-      "version": "1.0.0",
       "author": {
         "name": "zcj99888"
       },

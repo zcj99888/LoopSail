@@ -576,7 +576,7 @@ class LauncherTests(unittest.TestCase):
         payload = loopsail.parse_json_tail("startup noise\n{\"structured_output\": {\"status\": \"ok\"}}\n")
         self.assertEqual(payload["structured_output"]["status"], "ok")
 
-    def test_worker_launcher_uses_prefix_and_does_not_select_model(self) -> None:
+    def test_worker_launcher_supports_generic_prefix_and_does_not_select_model(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -586,7 +586,12 @@ class LauncherTests(unittest.TestCase):
         task_state = loopsail.new_task_state(task_value)
         task_state["attempts"] = 1
         config = json.loads(json.dumps(loopsail.DEFAULT_CONFIG))
-        config["claude"]["command_prefix"] = ["bash", "-lic", "ccds \"$@\"", "loopsail-claude"]
+        config["claude"]["command_prefix"] = [
+            "bash",
+            "-lic",
+            "profile-claude \"$@\"",
+            "loopsail-claude",
+        ]
         result = {
             "structured_output": {
                 "task_id": "TASK-001",
@@ -606,8 +611,13 @@ class LauncherTests(unittest.TestCase):
 
         with mock.patch.object(loopsail, "run_process", side_effect=fake_run):
             worker_result, _ = loopsail.invoke_worker(root, task_file, task_value, task_state, config)
-        self.assertEqual(captured[:4], ["bash", "-lic", "ccds \"$@\"", "loopsail-claude"])
+        self.assertEqual(
+            captured[:4],
+            ["bash", "-lic", "profile-claude \"$@\"", "loopsail-claude"],
+        )
         self.assertIn("--no-session-persistence", captured)
+        self.assertIn("--strict-mcp-config", captured)
+        self.assertIn("--disable-slash-commands", captured)
         self.assertIn("--tools", captured)
         self.assertNotIn("--model", captured)
         self.assertEqual(worker_result["status"], "completed")
@@ -643,6 +653,136 @@ class LauncherTests(unittest.TestCase):
             loopsail.validate_worker_result(unknown, "TASK-001")
 
 
+class DoctorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.config = json.loads(json.dumps(loopsail.DEFAULT_CONFIG))
+
+    def test_default_launcher_reports_active_profile_and_sanitized_auth(self) -> None:
+        calls: list[tuple[list[str], dict[str, str]]] = []
+
+        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append((list(argv), dict(kwargs["env"])))  # type: ignore[arg-type]
+            if argv[-1] == "--version":
+                return subprocess.CompletedProcess(argv, 0, "2.1.215 (Claude Code)\n", "")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                "shell startup noise\n"
+                '{"loggedIn":true,"authMethod":"oauth_token",'
+                '"apiProvider":"firstParty","token":"must-not-leak"}\n',
+                "",
+            )
+
+        inherited = {
+            "CLAUDECODE": "1",
+            "CLAUDE_CODE_ENTRYPOINT": "outer-session",
+            "CLAUDE_CONFIG_DIR": "/tmp/Claude Profile A",
+            "ANTHROPIC_API_KEY": "test-anthropic-key",
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, inherited, clear=True),
+            mock.patch.object(loopsail, "maybe_discover_project_root", return_value=self.root),
+            mock.patch.object(
+                loopsail, "load_config", return_value=(self.config, ["built-in defaults"])
+            ),
+            mock.patch.object(loopsail, "run_process", side_effect=fake_run),
+            contextlib.redirect_stdout(output),
+        ):
+            self.assertEqual(
+                loopsail.command_doctor(argparse.Namespace(runner_config=None)), 0
+            )
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(calls[0][0], ["claude", "--version"])
+        self.assertEqual(calls[1][0], ["claude", "auth", "status", "--json"])
+        self.assertEqual(payload["launcher_kind"], "active-profile")
+        self.assertFalse(payload["launcher_overridden"])
+        self.assertEqual(
+            payload["claude_profile"]["inherited_config_dir"],
+            "/tmp/Claude Profile A",
+        )
+        self.assertEqual(payload["authentication"]["method"], "oauth_token")
+        self.assertEqual(payload["authentication"]["provider"], "firstParty")
+        self.assertNotIn("must-not-leak", output.getvalue())
+        for _, environment in calls:
+            self.assertNotIn("CLAUDECODE", environment)
+            self.assertFalse(any(key.startswith("CLAUDE_CODE_") for key in environment))
+            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], "/tmp/Claude Profile A")
+            self.assertEqual(environment["ANTHROPIC_API_KEY"], "test-anthropic-key")
+
+    def test_profile_reporting_handles_default_empty_and_relative_paths(self) -> None:
+        fake_home = self.root / "home"
+        cases = (
+            ({}, fake_home / ".claude", "default"),
+            ({"CLAUDE_CONFIG_DIR": "   "}, fake_home / ".claude", "default"),
+            ({"CLAUDE_CONFIG_DIR": "profiles/work"}, self.root / "profiles/work", "CLAUDE_CONFIG_DIR"),
+        )
+        for environment, expected, source in cases:
+            with self.subTest(environment=environment), mock.patch.dict(
+                os.environ, environment, clear=True
+            ), mock.patch.object(loopsail.Path, "home", return_value=fake_home), working_directory(
+                self.root
+            ):
+                profile = loopsail.active_claude_profile()
+                self.assertEqual(profile["inherited_config_dir"], str(expected.resolve()))
+                self.assertEqual(profile["source"], source)
+
+    def test_doctor_fails_closed_for_authentication_errors(self) -> None:
+        version = subprocess.CompletedProcess(
+            ["claude", "--version"], 0, "2.1.215 (Claude Code)\n", ""
+        )
+        cases = (
+            (
+                "authentication command failure",
+                subprocess.CompletedProcess(["claude", "auth"], 7, "", "failed"),
+                "authentication check",
+            ),
+            (
+                "malformed status",
+                subprocess.CompletedProcess(["claude", "auth"], 0, "not-json", ""),
+                "not valid JSON",
+            ),
+            (
+                "logged out",
+                subprocess.CompletedProcess(
+                    ["claude", "auth"], 0, '{"loggedIn":false}', ""
+                ),
+                "not authenticated",
+            ),
+            (
+                "invalid method",
+                subprocess.CompletedProcess(
+                    ["claude", "auth"],
+                    0,
+                    '{"loggedIn":true,"authMethod":{"unexpected":true}}',
+                    "",
+                ),
+                "method was invalid",
+            ),
+        )
+        for label, auth_result, message in cases:
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    loopsail, "maybe_discover_project_root", return_value=self.root
+                ),
+                mock.patch.object(
+                    loopsail,
+                    "load_config",
+                    return_value=(self.config, ["built-in defaults"]),
+                ),
+                mock.patch.object(
+                    loopsail, "run_process", side_effect=[version, auth_result]
+                ),
+                self.assertRaisesRegex(loopsail.LoopSailError, message),
+            ):
+                loopsail.command_doctor(argparse.Namespace(runner_config=None))
+
+
 class WorkerEnvTests(unittest.TestCase):
     def test_outer_claude_session_markers_are_removed_from_worker_environment(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -666,8 +806,10 @@ class WorkerEnvTests(unittest.TestCase):
             }
         }
         captured_env: dict[str, str] = {}
+        captured_argv: list[str] = []
 
         def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            captured_argv.extend(argv)
             captured_env.update(kwargs["env"])  # type: ignore[arg-type]
             return subprocess.CompletedProcess(argv, 0, json.dumps(result), "")
 
@@ -675,7 +817,7 @@ class WorkerEnvTests(unittest.TestCase):
             "CLAUDECODE": "1",
             "CLAUDE_CODE_ENTRYPOINT": "outer-session",
             "CLAUDE_CODE_TEST_MARKER": "remove-me",
-            "CLAUDE_CONFIG_DIR": "/tmp/test-claude-config",
+            "CLAUDE_CONFIG_DIR": "/tmp/test claude profile",
             "ANTHROPIC_API_KEY": "test-anthropic-key",
         }
         with mock.patch.dict(os.environ, inherited), mock.patch.object(
@@ -685,6 +827,7 @@ class WorkerEnvTests(unittest.TestCase):
 
         self.assertNotIn("CLAUDECODE", captured_env)
         self.assertFalse(any(key.startswith("CLAUDE_CODE_") for key in captured_env))
+        self.assertEqual(captured_argv[0], "claude")
         self.assertEqual(captured_env["CLAUDE_CONFIG_DIR"], inherited["CLAUDE_CONFIG_DIR"])
         self.assertEqual(captured_env["ANTHROPIC_API_KEY"], inherited["ANTHROPIC_API_KEY"])
         self.assertEqual(captured_env["LOOPSAIL_PROJECT_ROOT"], str(root))

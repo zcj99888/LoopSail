@@ -29,8 +29,16 @@ class PluginBundleTests(unittest.TestCase):
         manifest = json.loads(
             (PLUGIN_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
         )
+        marketplace = json.loads(
+            (PROJECT_ROOT / ".claude-plugin" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        marketplace_plugin = marketplace["plugins"][0]
         self.assertEqual(manifest["name"], "loopsail")
         self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
+        self.assertEqual(marketplace_plugin["name"], manifest["name"])
+        self.assertNotIn("version", marketplace_plugin)
         self.assertTrue((SKILL_ROOT / "SKILL.md").is_file())
         self.assertTrue((SKILL_ROOT / "scripts" / "loopsail.py").is_file())
         self.assertTrue((SKILL_ROOT / "references" / "worker.md").is_file())
