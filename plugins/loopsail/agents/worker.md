@@ -30,5 +30,9 @@ argv, exit_code, and summary. Each lesson has exactly challenge, detour, root_ca
 resolution, and takeaway; nullable fields use JSON null. A completed result requires
 blocker null; a blocked result requires a non-empty blocker.
 
+Every changed_files entry must be a project-relative POSIX path such as
+`src/module.py`; never return an absolute path, a `file://` URI, or a path containing
+`..`.
+
 The Coordinator independently computes the actual Git diff and reruns verification.
 Your changed_files and verification_results are informative, never authoritative.

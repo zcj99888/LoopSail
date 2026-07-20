@@ -654,6 +654,7 @@ class HookTests(ProjectTestCase):
         decision = json.loads(first)
         self.assertEqual(decision["decision"], "block")
         self.assertIn("worker-result v2", decision["reason"])
+        self.assertIn("project-relative POSIX paths", decision["reason"])
 
         second = self.project.stop_agent("still not json", stop_hook_active=True)
         self.assertEqual(second, "")

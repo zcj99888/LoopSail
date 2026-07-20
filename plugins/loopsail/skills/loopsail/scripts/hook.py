@@ -462,7 +462,9 @@ def subagent_stop(payload: dict[str, Any]) -> int:
                 block_reason = (
                     "Your final response did not satisfy worker-result v2: "
                     f"{exc}. Return exactly one JSON object with no prose or code fence, "
-                    "preserving request_id/list_id/task_id/attempt from the request."
+                    "preserving request_id/list_id/task_id/attempt from the request. "
+                    "Use only project-relative POSIX paths in changed_files (for example "
+                    "src/module.py), never absolute paths or paths containing '..'."
                 )
                 result = {}
             else:
