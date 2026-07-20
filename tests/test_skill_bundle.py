@@ -24,7 +24,7 @@ class PluginBundleTests(unittest.TestCase):
             (PLUGIN_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["name"], "loopsail")
-        self.assertEqual(manifest["version"], "2.0.0")
+        self.assertEqual(manifest["version"], "2.0.1")
         agents = list((PLUGIN_ROOT / "agents").glob("*.md"))
         self.assertEqual([path.stem for path in agents], ["worker"])
         agent = agents[0].read_text(encoding="utf-8")

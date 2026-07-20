@@ -264,6 +264,23 @@ def denial(reason: str) -> None:
     )
 
 
+def allowance() -> None:
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": (
+                        "bound loopsail:worker call passed the active request guard"
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
 def subagent_start(payload: dict[str, Any]) -> int:
     if payload.get("agent_type") != WORKER_TYPE:
         return 0
@@ -349,6 +366,8 @@ def pre_tool_use(payload: dict[str, Any]) -> int:
         )
     if reason:
         denial(reason)
+    else:
+        allowance()
     return 0
 
 

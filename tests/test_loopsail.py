@@ -590,8 +590,15 @@ class HookTests(ProjectTestCase):
             "tool_name": "Read",
             "tool_input": {"file_path": str(self.project.root / request_path)},
         }
-        with contextlib.redirect_stdout(io.StringIO()):
+        allowed_output = io.StringIO()
+        with contextlib.redirect_stdout(allowed_output):
             self.assertEqual(hook.pre_tool_use(allowed), 0)
+        self.assertEqual(
+            json.loads(allowed_output.getvalue())["hookSpecificOutput"][
+                "permissionDecision"
+            ],
+            "allow",
+        )
 
         denied = {**allowed, "tool_input": {
             "file_path": str(self.project.root / ".loopsail/runs/test-list/state.json")
