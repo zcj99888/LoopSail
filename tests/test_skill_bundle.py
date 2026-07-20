@@ -24,13 +24,14 @@ class PluginBundleTests(unittest.TestCase):
             (PLUGIN_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["name"], "loopsail")
-        self.assertEqual(manifest["version"], "2.0.2")
+        self.assertEqual(manifest["version"], "2.0.3")
         agents = list((PLUGIN_ROOT / "agents").glob("*.md"))
         self.assertEqual([path.stem for path in agents], ["worker"])
         agent = agents[0].read_text(encoding="utf-8")
         self.assertIn("name: worker", agent)
         self.assertIn("tools: Read, Edit, Write, Glob, Grep, Bash", agent)
         self.assertIn("project-relative POSIX path", agent)
+        self.assertIn("Do not read TASKS.json", agent)
         for forbidden in ("Agent,", "Skill,", "Web,", "AskUserQuestion"):
             self.assertNotIn(forbidden, agent)
 

@@ -1,6 +1,6 @@
 {
   "name": "loopsail",
-  "version": "2.0.2",
+  "version": "2.0.3",
   "description": "Runs structured development task lists through visible in-session Claude subagents with protocol-v2 validation, guarded tools, recovery, and task commits.",
   "author": {
     "name": "zcj99888"

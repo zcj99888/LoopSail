@@ -145,7 +145,8 @@ def decide(
         request_path = str(policy["request_path"])
         task_file = str(policy["task_file"])
         allowed = list(policy.get("allowed_paths") or [])
-        protected = BUILTIN_PROTECTED + list(policy.get("protected_paths") or []) + [task_file]
+        control_paths = BUILTIN_PROTECTED + [task_file]
+        protected = control_paths + list(policy.get("protected_paths") or [])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return "invalid loopsail worker policy"
 
@@ -182,6 +183,8 @@ def decide(
                 if tool_name == "Read" and relative == request_path:
                     continue
                 return "only the bound immutable worker request may be read from .loopsail"
+            if any(matches(relative, pattern) for pattern in control_paths):
+                return f"loopsail coordinator control path may not be accessed: {relative}"
             if tool_name in MUTATING_FILE_TOOLS:
                 if any(matches(relative, pattern) for pattern in protected):
                     return f"loopsail protected path may not be edited: {relative}"

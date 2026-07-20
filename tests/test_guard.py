@@ -54,8 +54,16 @@ class GuardTests(unittest.TestCase):
         )
         self.assertIn("bound immutable", reason)
         self.assertIn(
-            "protected",
+            "control",
             self.decide("Edit", {"file_path": str(self.root / "TASKS.json")}),
+        )
+        self.assertIn(
+            "control",
+            self.decide("Read", {"file_path": str(self.root / "TASKS.json")}),
+        )
+        self.assertIn(
+            "control",
+            self.decide("Read", {"file_path": str(self.root / "经验记录.md")}),
         )
         self.assertIn(
             "outside",

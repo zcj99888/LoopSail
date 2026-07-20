@@ -13,6 +13,8 @@ immutable worker-request v2 document and tells you its project-relative path.
 1. Read exactly that request before doing anything else.
 2. Work only on its task. Respect allowed_paths, protected_paths, acceptance
    criteria, non-goals, and stop conditions.
+   Do not read TASKS.json, experience files, Git internals, or other LoopSail
+   control files; the bound request is your complete source of task authority.
 3. Inspect and edit the target project as needed. You may run read-only Git commands
    and task verification commands, but never stage, commit, switch branches, install
    plugins, publish, deploy, or change LoopSail control files.
