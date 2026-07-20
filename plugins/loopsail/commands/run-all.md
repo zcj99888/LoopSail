@@ -8,6 +8,11 @@ disable-model-invocation: true
 
 This command is explicit authorization to supervise the whole task list sequentially.
 
+Tool routing is literal: do not call the Skill tool or another slash command. Each
+Coordinator action below means invoking the Bash tool with exactly the matching
+`${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash <action>` command.
+Do not substitute exploratory shell commands.
+
 1. Run doctor and validate once.
 2. Repeatedly run prepare-step and inspect its command-envelope v2 data.
 3. For spawn_worker, invoke exactly one foreground Agent with subagent_type

@@ -7,6 +7,10 @@ disable-model-invocation: true
 
 # Diagnose and retry a blocked task
 
+Tool routing is literal: do not call the Skill tool or another slash command. Use the
+exact allowed Bash Coordinator commands in the frontmatter for `status`, `validate`,
+`retry-ai`, or `retry-human`; append only the validated task ID to a retry action.
+
 Treat the argument as exactly one task ID matching
 ^[A-Za-z][A-Za-z0-9._-]{0,63}$ and equal to status.active_task.
 

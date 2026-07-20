@@ -24,7 +24,7 @@ class PluginBundleTests(unittest.TestCase):
             (PLUGIN_ROOT / ".claude-plugin/plugin.json").read_text(encoding="utf-8")
         )
         self.assertEqual(manifest["name"], "loopsail")
-        self.assertEqual(manifest["version"], "2.0.3")
+        self.assertEqual(manifest["version"], "2.0.4")
         agents = list((PLUGIN_ROOT / "agents").glob("*.md"))
         self.assertEqual([path.stem for path in agents], ["worker"])
         agent = agents[0].read_text(encoding="utf-8")
@@ -62,6 +62,7 @@ class PluginBundleTests(unittest.TestCase):
             self.assertIn("description:", content, path)
             self.assertIn("allowed-tools:", content, path)
             self.assertIn("${CLAUDE_PLUGIN_ROOT}", content, path)
+            self.assertIn("do not call the Skill tool", content, path)
         for name in ("run-once", "run-all"):
             content = (PLUGIN_ROOT / "commands" / f"{name}.md").read_text(
                 encoding="utf-8"

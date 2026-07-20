@@ -5,7 +5,10 @@ allowed-tools: ["Read", "Edit", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scri
 
 # Validate TASKS.json
 
-Run the fixed validate action and parse its command-envelope v2 response. It validates
+Tool routing is literal: do not call the Skill tool or another slash command. Invoke
+the Bash tool with exactly
+`${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash validate` and parse
+its command-envelope v2 response. It validates
 only the project-root TASKS.json. If validation fails, read TASKS.json and the bundled
 task-list.schema.json. Fix only objective schema, path, dependency, or verification
 command shape errors; do not invent requirements. Re-run validate and report the list
