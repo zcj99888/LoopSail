@@ -1,80 +1,156 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "LoopSail Worker Result",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LoopSail Worker Result v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "task_id",
+    "attempt",
+    "blocker",
+    "changed_files",
+    "kind",
+    "lessons",
+    "list_id",
+    "request_id",
+    "schema_version",
     "status",
     "summary",
-    "changed_files",
-    "verification_results",
-    "lessons",
-    "blocker"
+    "task_id",
+    "verification_results"
   ],
   "properties": {
-    "task_id": {"type": "string", "minLength": 1},
-    "status": {"enum": ["completed", "blocked"]},
-    "summary": {"type": "string"},
+    "schema_version": {
+      "const": 2
+    },
+    "kind": {
+      "const": "worker-result"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "list_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "blocked"
+      ]
+    },
+    "summary": {
+      "type": "string"
+    },
     "changed_files": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
-      "uniqueItems": true
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
     },
     "verification_results": {
       "type": "array",
       "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["argv", "exit_code"],
-        "properties": {
-          "argv": {
-            "type": "array",
-            "items": {"type": "string"},
-            "minItems": 1
-          },
-          "exit_code": {"type": ["integer", "null"]},
-          "summary": {"type": "string"}
-        }
+        "$ref": "#/definitions/verification-result"
       }
     },
     "lessons": {
       "type": "array",
       "maxItems": 10,
       "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "challenge",
-          "detour",
-          "root_cause",
-          "resolution",
-          "takeaway"
-        ],
-        "properties": {
-          "challenge": {"type": "string", "minLength": 1, "maxLength": 2000},
-          "detour": {
-            "oneOf": [
-              {"type": "string", "minLength": 1, "maxLength": 2000},
-              {"type": "null"}
-            ]
-          },
-          "root_cause": {
-            "oneOf": [
-              {"type": "string", "minLength": 1, "maxLength": 2000},
-              {"type": "null"}
-            ]
-          },
-          "resolution": {
-            "oneOf": [
-              {"type": "string", "minLength": 1, "maxLength": 2000},
-              {"type": "null"}
-            ]
-          },
-          "takeaway": {"type": "string", "minLength": 1, "maxLength": 2000}
+        "$ref": "#/definitions/lesson"
+      }
+    },
+    "blocker": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "definitions": {
+    "verification-result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "argv",
+        "exit_code",
+        "summary"
+      ],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string"
         }
       }
     },
-    "blocker": {"type": ["string", "null"]}
+    "lesson": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "challenge",
+        "detour",
+        "root_cause",
+        "resolution",
+        "takeaway"
+      ],
+      "properties": {
+        "challenge": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "detour": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "root_cause": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "resolution": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "takeaway": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2000
+        }
+      }
+    }
   }
 }

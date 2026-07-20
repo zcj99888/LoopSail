@@ -1,0 +1,112 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LoopSail Worker Event v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "at",
+    "sequence",
+    "request_id",
+    "list_id",
+    "task_id",
+    "attempt",
+    "agent_id",
+    "agent_type",
+    "hook_event",
+    "tool_name",
+    "target_paths",
+    "command_category",
+    "command_sha256",
+    "outcome"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "kind": {
+      "const": "worker-event"
+    },
+    "at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "list_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "agent_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent_type": {
+      "const": "loopsail:worker"
+    },
+    "hook_event": {
+      "enum": [
+        "SubagentStart",
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStop",
+        "log_truncated"
+      ]
+    },
+    "tool_name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "target_paths": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "command_category": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command_sha256": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "outcome": {
+      "enum": [
+        "started",
+        "allowed",
+        "denied",
+        "succeeded",
+        "failed",
+        "captured",
+        "corrected",
+        "protocol_failed",
+        "truncated"
+      ]
+    }
+  }
+}

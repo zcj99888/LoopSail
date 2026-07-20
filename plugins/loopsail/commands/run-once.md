@@ -1,15 +1,22 @@
 ---
-description: "Execute or recover one supervised loopsail progress unit"
-allowed-tools: ["Read", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash doctor)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash validate)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash run-once)", "Bash(git status:*)", "Bash(git diff:*)"]
+description: "Prepare, visibly execute, and finalize one LoopSail subagent task"
+allowed-tools: ["Read", "Agent(loopsail:worker)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash doctor)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash validate)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash prepare-step)", "Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash finalize-step)", "Bash(git status:*)", "Bash(git diff:*)"]
 ---
 
-# Run one loopsail step
+# Run one LoopSail step
 
-Act as the Supervisor defined by the `loopsail` skill. Use only the project-root `TASKS.json`.
+Act as the Supervisor. Use only project-root TASKS.json and parse every Coordinator
+response as one command-envelope v2 JSON document.
 
-Use Bash internally with `"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py" slash <action>` for the fixed actions below.
+1. Run doctor and validate.
+2. Run prepare-step.
+3. If data.action is spawn_worker, invoke the Agent tool exactly once with
+   subagent_type loopsail:worker, prompt "Execute the active LoopSail worker request.",
+   and run_in_background false. The hook supplies the authoritative request path.
+4. Whether the Agent succeeds, blocks, or ends unexpectedly, always run finalize-step.
+5. If prepare-step reports data.action finalize_pending, skip Agent and run finalize-step.
+6. Stop after this one prepare/Agent/finalize unit. Report the actual Coordinator
+   result, task commit or blocker, remaining work, and the next slash command.
 
-1. Perform the skill's preflight, including the fixed doctor and validate actions and a read-only clean-worktree check when this list has not started.
-2. Launch the fixed `run-once` action as a background Bash task because a Worker may run for up to 2700 seconds. Poll the same process until it exits; never start a duplicate because output is temporarily quiet.
-3. Interpret the fresh step report and actual exit code according to the skill. Read referenced logs only when diagnosing a block.
-4. Report the performed unit, task result, branch, remaining work, and the next slash command. Do not continue to another step and do not ask the user to run a shell command.
+Never spawn a background worker or a second Agent for the same request. Never merge,
+push, publish, deploy, or discard the retained diff.

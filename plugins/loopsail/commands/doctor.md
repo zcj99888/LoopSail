@@ -1,8 +1,11 @@
 ---
-description: "Check the loopsail runtime and configured Claude launcher"
+description: "Check the LoopSail 2.0 runtime, worker agent, hooks, configuration, and schemas"
 allowed-tools: ["Bash(${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py slash doctor)"]
 ---
 
-# Check loopsail
+# Check LoopSail
 
-Use Bash internally to execute `"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/loopsail.py" slash doctor`. Report whether the launcher and authentication are healthy, the inherited Claude profile directory, whether the launcher was explicitly overridden, the detected Claude Code version, and any configuration source that was loaded. Do not expose credentials or ask the user to run a shell command.
+Run the fixed doctor action. Parse its single command-envelope v2 JSON document and
+report whether the worker agent, all four hook phases, configuration, Python runtime,
+and checked-in Draft-07 schemas are healthy. Do not expose internal absolute plugin
+paths or ask the user to run a shell command.

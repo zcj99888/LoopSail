@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "loopsail",
-      "description": "Runs structured development task lists through supervised Claude workers with validation, recovery, and guarded Git commits.",
+      "description": "Runs structured development task lists through visible in-session Claude subagents with protocol-v2 validation, guarded tools, recovery, and task commits.",
       "author": {
         "name": "zcj99888"
       },

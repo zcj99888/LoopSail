@@ -15,14 +15,23 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Sequence
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from protocol import (  # noqa: E402
+    ProtocolError,
+    command_envelope,
+    validate_worker_result as validate_worker_result_v2,
+)
+
 TOOL_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_DIR = TOOL_ROOT / "references"
-PROMPT_PATH = TOOL_ROOT / "references" / "worker.md"
-SETTINGS_PATH = TOOL_ROOT / "references" / "claude-settings.json"
 TEMPLATE_DIR = TOOL_ROOT / "templates"
 
 INIT_TEMPLATE_FILES = (
@@ -38,6 +47,7 @@ INIT_GITIGNORE_HEADER = "# loopsail 本地输入与运行状态"
 INIT_GITIGNORE_ENTRIES = (
     "/TASKS.json",
     ".loopsail/input/",
+    ".loopsail/output/",
     ".loopsail/runs/",
     ".loopsail/logs/",
     ".loopsail/lock",
@@ -45,14 +55,13 @@ INIT_GITIGNORE_ENTRIES = (
 INIT_COMMIT_MESSAGE = "chore: initialize loopsail"
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "claude": {"command_prefix": ["claude"], "extra_args": []},
-    "worker_timeout_seconds": 2700,
-    "max_budget_usd": None,
-    "log_output_limit_bytes": 65536,
+    "schema_version": 2,
+    "kind": "loopsail-config",
     "protected_paths": [],
+    "verification_output_limit_bytes": 65536,
+    "event_log_max_bytes": 5 * 1024 * 1024,
 }
 TOP_CONFIG_KEYS = set(DEFAULT_CONFIG)
-CLAUDE_CONFIG_KEYS = {"command_prefix", "extra_args"}
 TASK_REQUIRED = {
     "id",
     "title",
@@ -63,9 +72,71 @@ TASK_REQUIRED = {
     "verify_commands",
 }
 TASK_OPTIONAL = {"allowed_paths", "source_refs", "non_goals", "stop_conditions"}
-LIST_REQUIRED = {"schema_version", "list_id", "project", "final_verify_commands", "tasks"}
+LIST_REQUIRED = {
+    "schema_version",
+    "kind",
+    "list_id",
+    "project",
+    "final_verify_commands",
+    "tasks",
+}
 LIST_OPTIONAL = {"$schema"}
 STATUS_VALUES = {"pending", "running", "done", "blocked", "superseded"}
+STATE_FIELDS = {
+    "schema_version",
+    "kind",
+    "list_id",
+    "project",
+    "task_file",
+    "branch",
+    "base_commit",
+    "project_status",
+    "active_task",
+    "active_request",
+    "last_finalized_request",
+    "final_verification",
+    "final_verification_attempts",
+    "tasks",
+    "created_at",
+    "updated_at",
+}
+TASK_STATE_FIELDS = {
+    "definition_hash",
+    "status",
+    "attempts",
+    "attempt_sequence",
+    "ai_retry_count",
+    "commit",
+    "last_failure",
+    "updated_at",
+}
+LEASE_FIELDS = {
+    "request_id",
+    "list_id",
+    "task_id",
+    "attempt",
+    "request_path",
+    "output_path",
+    "event_log_path",
+    "task_input_hash",
+    "task_definition_hash",
+    "experience_hash",
+    "head_commit",
+    "index_hash",
+    "agent_id",
+    "session_id",
+    "started_at",
+    "captured_at",
+    "correction_used",
+    "last_protocol_error",
+    "protocol_failure",
+    "result_status",
+    "event_sequence",
+    "event_truncated",
+    "event_log_max_bytes",
+    "fatal_error",
+    "created_at",
+}
 ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 SECRET_VALUE_RE = re.compile(
     r"(?i)(?:api[_-]?key|(?:access[_-]?)?token|password|secret|credential)\s*[=:]|"
@@ -83,9 +154,7 @@ AI_RETRY_LIMIT = 1
 STEP_REPORT_FILE = "last-step.json"
 EXIT_PROGRESSED = 3
 EXIT_IDLE = 4
-MAX_LESSONS_PER_ATTEMPT = 10
 MAX_LESSON_FIELD_LENGTH = 2000
-LESSON_FIELDS = {"challenge", "detour", "root_cause", "resolution", "takeaway"}
 CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r"(?i)\b(api[_-]?key|(?:access[_-]?)?token|password|secret|credential)\b"
     r"\s*([=:])\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
@@ -98,6 +167,10 @@ ABSOLUTE_PATH_RE = re.compile(
 
 class LoopSailError(RuntimeError):
     """Expected user-facing failure."""
+
+    def __init__(self, message: str, *, code: str = "loopsail_error") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def utc_now() -> str:
@@ -133,6 +206,8 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+        raise LoopSailError(f"refusing to write through a symbolic link: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -195,43 +270,6 @@ def run_process(
     return result
 
 
-def claude_child_environment() -> dict[str, str]:
-    """Return an environment suitable for a nested Claude CLI process."""
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key != "CLAUDECODE" and not key.startswith("CLAUDE_CODE_")
-    }
-
-
-def claude_launcher_argv(config: dict[str, Any], *args: str) -> list[str]:
-    return (
-        list(config["claude"]["command_prefix"])
-        + list(config["claude"]["extra_args"])
-        + list(args)
-    )
-
-
-def claude_launcher_overridden(config: dict[str, Any]) -> bool:
-    return config["claude"] != DEFAULT_CONFIG["claude"]
-
-
-def active_claude_profile() -> dict[str, str]:
-    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
-    if configured:
-        path = Path(configured).expanduser()
-        if not path.is_absolute():
-            path = Path.cwd() / path
-        return {
-            "inherited_config_dir": str(path.resolve()),
-            "source": "CLAUDE_CONFIG_DIR",
-        }
-    return {
-        "inherited_config_dir": str((Path.home() / ".claude").resolve()),
-        "source": "default",
-    }
-
-
 def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     return run_process(["git", *args], cwd=root, check=check)
 
@@ -251,18 +289,6 @@ def discover_project_root(start: Path | None = None) -> Path:
     if root is None:
         raise LoopSailError("loopsail must run inside a Git repository")
     return root
-
-
-def confirm(prompt: str) -> bool:
-    try:
-        answer = input(f"{prompt} [y/N] ")
-    except EOFError:
-        return False
-    return answer.strip().lower() in {"y", "yes"}
-
-
-def stdin_is_interactive() -> bool:
-    return bool(getattr(sys.stdin, "isatty", lambda: False)())
 
 
 def require_safe_init_file(path: Path) -> None:
@@ -488,34 +514,21 @@ def validate_config(value: dict[str, Any], *, source: Path | None = None) -> Non
     if unknown:
         raise LoopSailError(f"unknown keys in {label}: {', '.join(sorted(unknown))}")
     reject_secret_values(value)
-    if "claude" in value:
-        claude = value["claude"]
-        if not isinstance(claude, dict):
-            raise LoopSailError(f"claude must be an object in {label}")
-        unknown_claude = set(claude) - CLAUDE_CONFIG_KEYS
-        if unknown_claude:
-            raise LoopSailError(
-                f"unknown claude keys in {label}: {', '.join(sorted(unknown_claude))}"
-            )
-        for field in CLAUDE_CONFIG_KEYS & set(claude):
-            ensure_string_list(
-                claude[field], field=f"claude.{field}", nonempty=field == "command_prefix"
-            )
-    for field in ("worker_timeout_seconds", "log_output_limit_bytes"):
+    version = value.get("schema_version")
+    if version != 2:
+        raise LoopSailError(
+            f"unsupported schema_version {version!r} in {label}; expected 2",
+            code="unsupported_schema_version",
+        )
+    if value.get("kind") != "loopsail-config":
+        raise LoopSailError(f"kind must be 'loopsail-config' in {label}")
+    for field in ("verification_output_limit_bytes", "event_log_max_bytes"):
         if field in value and (
             not isinstance(value[field], int)
             or isinstance(value[field], bool)
             or value[field] <= 0
         ):
             raise LoopSailError(f"{field} must be a positive integer in {label}")
-    if "max_budget_usd" in value:
-        budget = value["max_budget_usd"]
-        if budget is not None and (
-            not isinstance(budget, (int, float))
-            or isinstance(budget, bool)
-            or budget <= 0
-        ):
-            raise LoopSailError(f"max_budget_usd must be null or positive in {label}")
     if "protected_paths" in value:
         for item in ensure_string_list(value["protected_paths"], field="protected_paths"):
             safe_relative_path(item, field="protected_paths")
@@ -524,10 +537,7 @@ def validate_config(value: dict[str, Any], *, source: Path | None = None) -> Non
 def merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     result = json.loads(json.dumps(base))
     for key, value in overlay.items():
-        if key == "claude":
-            result["claude"].update(value)
-        else:
-            result[key] = value
+        result[key] = value
     return result
 
 
@@ -615,6 +625,11 @@ def find_cycles(tasks: dict[str, dict[str, Any]]) -> list[list[str]]:
 
 
 def validate_task_list(value: dict[str, Any], root: Path) -> dict[str, Any]:
+    if value.get("schema_version") != 2:
+        raise LoopSailError(
+            f"unsupported task-list schema_version {value.get('schema_version')!r}; expected 2",
+            code="unsupported_schema_version",
+        )
     unknown = set(value) - LIST_REQUIRED - LIST_OPTIONAL
     missing = LIST_REQUIRED - set(value)
     if missing or unknown:
@@ -624,8 +639,8 @@ def validate_task_list(value: dict[str, Any], root: Path) -> dict[str, Any]:
         if unknown:
             details.append("unknown " + ", ".join(sorted(unknown)))
         raise LoopSailError("invalid task-list fields: " + "; ".join(details))
-    if value["schema_version"] != 1:
-        raise LoopSailError("schema_version must be 1")
+    if value["kind"] != "task-list":
+        raise LoopSailError("task-list kind must be 'task-list'")
     for field in ("list_id", "project"):
         if not isinstance(value[field], str) or not value[field].strip():
             raise LoopSailError(f"{field} must be a non-empty string")
@@ -636,7 +651,8 @@ def validate_task_list(value: dict[str, Any], root: Path) -> dict[str, Any]:
     if not isinstance(value["final_verify_commands"], list):
         raise LoopSailError("final_verify_commands must be an array")
     normalized: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "kind": "task-list",
         "list_id": value["list_id"],
         "project": value["project"],
         "final_verify_commands": [
@@ -740,14 +756,17 @@ def new_task_state(task: dict[str, Any]) -> dict[str, Any]:
 def create_state(task_list: dict[str, Any], task_file: Path, root: Path) -> dict[str, Any]:
     branch = f"loopsail/{task_list['list_id'].lower()}"
     return {
-        "schema_version": 1,
+        "schema_version": 2,
+        "kind": "run-state",
         "list_id": task_list["list_id"],
         "project": task_list["project"],
-        "task_file": str(task_file),
+        "task_file": task_file.resolve().relative_to(root).as_posix(),
         "branch": branch,
         "base_commit": run_git(root, "rev-parse", "HEAD").stdout.strip(),
         "project_status": "executing",
         "active_task": None,
+        "active_request": None,
+        "last_finalized_request": None,
         "final_verification": None,
         "final_verification_attempts": 0,
         "tasks": {task["id"]: new_task_state(task) for task in task_list["tasks"]},
@@ -757,15 +776,50 @@ def create_state(task_list: dict[str, Any], task_file: Path, root: Path) -> dict
 
 
 def validate_state(state: dict[str, Any], task_list: dict[str, Any]) -> None:
-    if state.get("schema_version") != 1 or state.get("list_id") != task_list["list_id"]:
+    if state.get("schema_version") != 2:
+        raise LoopSailError(
+            f"unsupported runtime schema_version {state.get('schema_version')!r}; expected 2",
+            code="unsupported_schema_version",
+        )
+    if state.get("kind") != "run-state" or state.get("list_id") != task_list["list_id"]:
         raise LoopSailError("runtime state does not match the task list")
+    if set(state) != STATE_FIELDS:
+        raise LoopSailError(
+            "runtime state has missing or unexpected fields",
+            code="invalid_run_state",
+        )
     if state.get("project_status") not in {"executing", "blocked", "complete"}:
         raise LoopSailError("runtime project_status is invalid")
     if not isinstance(state.get("tasks"), dict):
         raise LoopSailError("runtime tasks must be an object")
+    if state.get("active_request") is not None and not isinstance(
+        state.get("active_request"), dict
+    ):
+        raise LoopSailError("runtime active_request must be an object or null")
     for task_id, item in state["tasks"].items():
-        if not isinstance(item, dict) or item.get("status") not in STATUS_VALUES:
+        if (
+            not isinstance(item, dict)
+            or not TASK_STATE_FIELDS.issubset(item)
+            or set(item) - TASK_STATE_FIELDS - {"verification"}
+            or item.get("status") not in STATUS_VALUES
+        ):
             raise LoopSailError(f"runtime state is invalid for {task_id}")
+    lease = state.get("active_request")
+    if isinstance(lease, dict):
+        if set(lease) != LEASE_FIELDS:
+            raise LoopSailError(
+                "active request lease has missing or unexpected fields",
+                code="invalid_attempt_lease",
+            )
+        if (
+            lease.get("list_id") != state["list_id"]
+            or lease.get("task_id") != state.get("active_task")
+            or state["tasks"].get(lease.get("task_id"), {}).get("status") != "running"
+        ):
+            raise LoopSailError(
+                "active request lease binding is invalid",
+                code="invalid_attempt_lease",
+            )
 
 
 def is_clean(root: Path) -> bool:
@@ -873,6 +927,11 @@ def diff_fingerprint(root: Path, paths: list[str]) -> str:
     return digest.hexdigest()
 
 
+def git_index_hash(root: Path) -> str:
+    result = run_git(root, "diff", "--cached", "--binary", "--no-ext-diff")
+    return hashlib.sha256(result.stdout.encode("utf-8", errors="replace")).hexdigest()
+
+
 def normalize_failure(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())[:1000]
 
@@ -940,8 +999,8 @@ def experience_log_reference(list_id: str, task_id: str, attempt: int) -> str:
 def summarize_experience_failure(value: str, stage: str, root: Path) -> str:
     if stage in {"任务验证", "中断恢复验证", "最终验证"}:
         return f"{stage}未通过；详细命令输出见对应日志。"
-    if stage == "Worker 执行":
-        return "Worker 进程未成功返回有效结构化结果；详细输出见对应日志。"
+    if stage in {"Worker 执行", "Agent 结果捕获", "Agent 输出协议"}:
+        return "子 Agent 未成功返回有效的协议 v2 结果；详细信息见对应日志。"
     if stage == "任务提交":
         return "任务提交失败；详细输出见对应日志。"
     return sanitize_experience_text(value, root)
@@ -1013,7 +1072,7 @@ def append_experience_record(
                 "",
                 "### 自动失败记录",
                 "",
-                "- Worker 未返回可用的结构化复盘；Coordinator 仅记录已知结果，不推测根因。",
+                "- 子 Agent 未返回可用的结构化复盘；Coordinator 仅记录已知结果，不推测根因。",
             ]
         )
     addition = "\n".join(lines) + "\n"
@@ -1033,7 +1092,7 @@ def execute_commands(
     root: Path, commands: list[dict[str, Any]], config: dict[str, Any]
 ) -> tuple[bool, list[dict[str, Any]], str | None]:
     records: list[dict[str, Any]] = []
-    output_limit = int(config["log_output_limit_bytes"])
+    output_limit = int(config["verification_output_limit_bytes"])
     for command in commands:
         cwd = (root / command["cwd"]).resolve()
         try:
@@ -1070,183 +1129,6 @@ def execute_commands(
             detail = record.get("failure") or record.get("stderr_tail") or record.get("stdout_tail")
             return False, records, f"verification failed: {' '.join(command['argv'])}: {detail}"
     return True, records, None
-
-
-def parse_json_tail(output: str) -> dict[str, Any]:
-    decoder = json.JSONDecoder()
-    starts = [index for index, char in enumerate(output) if char == "{"]
-    for start in reversed(starts):
-        try:
-            value, end = decoder.raw_decode(output[start:])
-        except json.JSONDecodeError:
-            continue
-        if output[start + end :].strip():
-            continue
-        if isinstance(value, dict):
-            return value
-    raise LoopSailError("Claude output did not end with a valid JSON object")
-
-
-def extract_worker_result(payload: dict[str, Any]) -> dict[str, Any]:
-    if isinstance(payload.get("structured_output"), dict):
-        return payload["structured_output"]
-    result = payload.get("result")
-    if isinstance(result, str):
-        with contextlib.suppress(json.JSONDecodeError):
-            nested = json.loads(result)
-            if isinstance(nested, dict):
-                return nested
-    return payload
-
-
-def validate_worker_result(value: dict[str, Any], task_id: str) -> dict[str, Any]:
-    required = {
-        "task_id",
-        "status",
-        "summary",
-        "changed_files",
-        "verification_results",
-        "lessons",
-        "blocker",
-    }
-    if set(value) != required:
-        raise LoopSailError("Worker result has invalid fields")
-    if value["task_id"] != task_id or value["status"] not in {"completed", "blocked"}:
-        raise LoopSailError("Worker result has an invalid task_id or status")
-    if not isinstance(value["summary"], str):
-        raise LoopSailError("Worker result summary must be a string")
-    ensure_string_list(value["changed_files"], field="Worker changed_files")
-    if not isinstance(value["verification_results"], list):
-        raise LoopSailError("Worker verification_results must be an array")
-    lessons = value["lessons"]
-    if not isinstance(lessons, list) or len(lessons) > MAX_LESSONS_PER_ATTEMPT:
-        raise LoopSailError(
-            f"Worker lessons must be an array with at most {MAX_LESSONS_PER_ATTEMPT} items"
-        )
-    for index, lesson in enumerate(lessons):
-        if not isinstance(lesson, dict) or set(lesson) != LESSON_FIELDS:
-            raise LoopSailError(f"Worker lessons[{index}] has invalid fields")
-        for field in ("challenge", "takeaway"):
-            text = lesson[field]
-            if (
-                not isinstance(text, str)
-                or not text.strip()
-                or len(text) > MAX_LESSON_FIELD_LENGTH
-            ):
-                raise LoopSailError(f"Worker lessons[{index}].{field} is invalid")
-        for field in ("detour", "root_cause", "resolution"):
-            text = lesson[field]
-            if text is not None and (
-                not isinstance(text, str)
-                or not text.strip()
-                or len(text) > MAX_LESSON_FIELD_LENGTH
-            ):
-                raise LoopSailError(f"Worker lessons[{index}].{field} is invalid")
-    if value["blocker"] is not None and not isinstance(value["blocker"], str):
-        raise LoopSailError("Worker blocker must be null or a string")
-    if value["status"] == "blocked" and not value["blocker"]:
-        raise LoopSailError("blocked Worker result requires a blocker")
-    return value
-
-
-def worker_prompt(
-    root: Path,
-    task_file: Path,
-    task: dict[str, Any],
-    attempt: int,
-    last_failure: dict[str, Any] | None,
-) -> str:
-    template = PROMPT_PATH.read_text(encoding="utf-8")
-    payload = {
-        "project_root": str(root),
-        "task_file": str(task_file),
-        "attempt": attempt,
-        "task": task,
-        "previous_failure": last_failure,
-    }
-    return template + "\n\n## Execution payload\n\n```json\n" + json.dumps(
-        payload, ensure_ascii=False, indent=2
-    ) + "\n```\n"
-
-
-def invoke_worker(
-    root: Path,
-    task_file: Path,
-    task: dict[str, Any],
-    task_state: dict[str, Any],
-    config: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    schema = load_json(SCHEMA_DIR / "worker-result.schema.json")
-    prompt = worker_prompt(
-        root, task_file, task, task_state["attempts"], task_state.get("last_failure")
-    )
-    argv = claude_launcher_argv(config)
-    argv.extend(
-        [
-            "-p",
-            "--no-session-persistence",
-            "--strict-mcp-config",
-            "--disable-slash-commands",
-            "--output-format",
-            "json",
-            "--json-schema",
-            json.dumps(schema, ensure_ascii=False),
-            "--permission-mode",
-            "dontAsk",
-            "--allowedTools",
-            "Read,Edit,Write,Glob,Grep,Bash",
-            "--tools",
-            "Read,Edit,Write,Glob,Grep,Bash",
-            "--settings",
-            str(SETTINGS_PATH),
-            prompt,
-        ]
-    )
-    if config["max_budget_usd"] is not None:
-        insert_at = len(config["claude"]["command_prefix"]) + len(config["claude"]["extra_args"])
-        argv[insert_at:insert_at] = ["--max-budget-usd", str(config["max_budget_usd"])]
-    env = claude_child_environment()
-    env.update(
-        {
-            "LOOPSAIL_TOOL_DIR": str(TOOL_ROOT),
-            "LOOPSAIL_PROJECT_ROOT": str(root),
-            "LOOPSAIL_TASK_FILE": str(task_file),
-            "LOOPSAIL_ALLOWED_PATHS": json.dumps(task.get("allowed_paths") or []),
-            "LOOPSAIL_PROTECTED_PATHS": json.dumps(config["protected_paths"]),
-        }
-    )
-    started = time.monotonic()
-    result = run_process(
-        argv,
-        cwd=root,
-        timeout=int(config["worker_timeout_seconds"]),
-        env=env,
-    )
-    metadata = {
-        "exit_code": result.returncode,
-        "duration_seconds": round(time.monotonic() - started, 3),
-        "stdout_tail": bounded(result.stdout, int(config["log_output_limit_bytes"])),
-        "stderr_tail": bounded(result.stderr, int(config["log_output_limit_bytes"])),
-    }
-    if result.returncode != 0:
-        raise LoopSailError(
-            f"Claude worker exited with {result.returncode}: "
-            f"{metadata['stderr_tail'] or metadata['stdout_tail']}"
-        )
-    payload = parse_json_tail(result.stdout)
-    worker_result = validate_worker_result(extract_worker_result(payload), task["id"])
-    return worker_result, metadata
-
-
-def save_attempt_log(
-    logs_root: Path,
-    list_id: str,
-    task_id: str,
-    attempt: int,
-    payload: dict[str, Any],
-) -> None:
-    path = logs_root / list_id / f"{task_id}-attempt-{attempt}.json"
-    atomic_write_json(path, payload)
 
 
 def record_failure(
@@ -1326,6 +1208,11 @@ def reconcile_task_list(
     previous: dict[str, Any],
 ) -> None:
     validate_state(state, task_list)
+    if state.get("active_request") is not None and previous != task_list:
+        raise LoopSailError(
+            "TASKS.json changed while an attempt lease is active; finalize the attempt",
+            code="task_input_changed",
+        )
     old_tasks = task_map(previous)
     new_tasks = task_map(task_list)
     blocked_task = state.get("active_task") if state["project_status"] == "blocked" else None
@@ -1416,18 +1303,17 @@ def all_tasks_finished(task_list: dict[str, Any], state: dict[str, Any]) -> bool
 @contextlib.contextmanager
 def project_lock(root: Path) -> Iterator[None]:
     lock_path = root / ".loopsail" / "lock"
+    if lock_path.parent.is_symlink() or lock_path.is_symlink():
+        raise LoopSailError("loopsail lock path must not be a symbolic link")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+", encoding="utf-8")
     acquired = False
-    lock_identity: tuple[int, int] | None = None
     try:
         try:
             import fcntl
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             acquired = True
-            descriptor = os.fstat(handle.fileno())
-            lock_identity = (descriptor.st_dev, descriptor.st_ino)
         except (ImportError, BlockingIOError) as exc:
             raise LoopSailError("another loopsail process is already running in this project") from exc
         handle.seek(0)
@@ -1437,10 +1323,6 @@ def project_lock(root: Path) -> Iterator[None]:
         yield
     finally:
         if acquired:
-            with contextlib.suppress(OSError):
-                current = lock_path.lstat()
-                if lock_identity == (current.st_dev, current.st_ino):
-                    lock_path.unlink()
             with contextlib.suppress(Exception):
                 import fcntl
 
@@ -1511,379 +1393,31 @@ def complete_task(
         }
     )
     state["active_task"] = None
+    state["active_request"] = None
     state["project_status"] = "executing"
     state["updated_at"] = utc_now()
     atomic_write_json(state_path, state)
     return commit
 
 
-def run_one_attempt(
-    root: Path,
-    task_file: Path,
-    task_list: dict[str, Any],
-    task: dict[str, Any],
-    state: dict[str, Any],
-    state_path: Path,
-    logs_root: Path,
-    config: dict[str, Any],
-) -> bool:
-    task_input_hash = file_hash(task_file)
-    expected_experience_hash = experience_file_hash(root)
-    item = state["tasks"][task["id"]]
-    item["attempts"] += 1
-    item["attempt_sequence"] = max(
-        int(item.get("attempt_sequence", 0)) + 1, item["attempts"]
-    )
-    attempt_number = item["attempt_sequence"]
-    item["status"] = "running"
-    item["updated_at"] = utc_now()
-    state["active_task"] = task["id"]
-    state["updated_at"] = utc_now()
-    atomic_write_json(state_path, state)
-    worker_result: dict[str, Any] | None = None
-    worker_meta: dict[str, Any] = {}
-    failure: str | None = None
-    failure_stage = "Worker 执行"
-    immediate = False
-    verification: list[dict[str, Any]] = []
-    experience_integrity_ok = True
-    experience_recorded = False
-    try:
-        worker_result, worker_meta = invoke_worker(root, task_file, task, item, config)
-        if experience_file_changed(root, expected_experience_hash):
-            failure = f"Worker changed or removed the protected experience log: {LESSONS_FILE}"
-            failure_stage = "经验文件安全校验"
-            immediate = True
-            experience_integrity_ok = False
-        elif not task_file.is_file() or file_hash(task_file) != task_input_hash:
-            failure = "Worker changed or removed the protected task-list input"
-            failure_stage = "任务清单安全校验"
-            immediate = True
-        elif worker_result["status"] == "blocked":
-            failure = worker_result["blocker"]
-            failure_stage = "Worker 主动阻塞"
-            immediate = True
-        else:
-            failure_stage = "修改范围校验"
-            paths = changed_paths(root)
-            violations = scope_errors(paths, task, config, task_file, root)
-            if violations:
-                failure = "; ".join(violations)
-                immediate = True
-            else:
-                failure_stage = "任务验证"
-                passed, verification, failure = execute_commands(
-                    root, task["verify_commands"], config
-                )
-                if passed:
-                    failure_stage = "经验记录"
-                    experience_recorded = append_experience_record(
-                        root,
-                        task_list,
-                        task_id=task["id"],
-                        title=task["title"],
-                        attempt=attempt_number,
-                        outcome="验证通过",
-                        stage="Worker 实现与任务验证",
-                        lessons=worker_result["lessons"],
-                        log_reference=experience_log_reference(
-                            task_list["list_id"], task["id"], attempt_number
-                        ),
-                    )
-                    failure_stage = "任务提交"
-                    commit = complete_task(
-                        root,
-                        task_file,
-                        task_list,
-                        task,
-                        state,
-                        state_path,
-                        config,
-                        verification,
-                    )
-                    save_attempt_log(
-                        logs_root,
-                        task_list["list_id"],
-                        task["id"],
-                        attempt_number,
-                        {
-                            "task_id": task["id"],
-                            "attempt": attempt_number,
-                            "retry_attempt": item["attempts"],
-                            "status": "done",
-                            "commit": commit,
-                            "worker": worker_result,
-                            "worker_process": worker_meta,
-                            "verification": verification,
-                            "experience_recorded": experience_recorded,
-                        },
-                    )
-                    print(f"DONE {task['id']} {commit[:12]} {task['title']}")
-                    return True
-    except LoopSailError as exc:
-        failure = str(exc)
-        if failure_stage == "经验记录":
-            immediate = True
-    if not task_file.is_file() or file_hash(task_file) != task_input_hash:
-        failure = "Worker changed or removed the protected task-list input"
-        failure_stage = "任务清单安全校验"
-        immediate = True
-    if experience_file_changed(root, expected_experience_hash) and not experience_recorded:
-        failure = f"Worker changed or removed the protected experience log: {LESSONS_FILE}"
-        failure_stage = "经验文件安全校验"
-        immediate = True
-        experience_integrity_ok = False
-    paths = changed_paths(root)
-    fingerprint = diff_fingerprint(root, paths)
-    blocked = record_failure(
-        state, task["id"], failure or "unknown worker failure", fingerprint, immediate=immediate
-    )
-    if experience_integrity_ok:
-        try:
-            experience_recorded = append_experience_record(
-                root,
-                task_list,
-                task_id=task["id"],
-                title=task["title"],
-                attempt=attempt_number,
-                outcome="阻塞" if blocked else "等待重试",
-                stage=failure_stage,
-                lessons=(
-                    worker_result["lessons"]
-                    if worker_result is not None and not experience_recorded
-                    else []
-                ),
-                failure=failure or "unknown worker failure",
-                log_reference=experience_log_reference(
-                    task_list["list_id"], task["id"], attempt_number
-                ),
-            )
-        except LoopSailError as exc:
-            failure = f"experience recording failed: {exc}"
-            failure_stage = "经验记录"
-            blocked = record_failure(state, task["id"], failure, fingerprint, immediate=True)
-    atomic_write_json(state_path, state)
-    save_attempt_log(
-        logs_root,
-        task_list["list_id"],
-        task["id"],
-        attempt_number,
-        {
-            "task_id": task["id"],
-            "attempt": attempt_number,
-            "retry_attempt": item["attempts"],
-            "status": "blocked" if blocked else "retry",
-            "failure": failure,
-            "worker": worker_result,
-            "worker_process": worker_meta,
-            "verification": verification,
-            "diff_fingerprint": fingerprint,
-            "experience_recorded": experience_recorded,
-        },
-    )
-    print(f"{'BLOCKED' if blocked else 'RETRY'} {task['id']}: {failure}")
-    return not blocked
+CommandResult = tuple[dict[str, Any], int, dict[str, Any] | None]
 
 
-def resume_running_task(
-    root: Path,
-    task_file: Path,
-    task_list: dict[str, Any],
-    state: dict[str, Any],
-    state_path: Path,
-    logs_root: Path,
-    config: dict[str, Any],
-) -> bool:
-    task_id = state.get("active_task")
-    if not task_id or state["tasks"].get(task_id, {}).get("status") != "running":
-        return False
-    task = task_map(task_list).get(task_id)
-    if task is None:
-        raise LoopSailError(f"running task is absent from the task list: {task_id}")
-    paths = changed_paths(root)
-    task_paths = task_owned_paths(paths)
-    attempt = int(
-        state["tasks"][task_id].get(
-            "attempt_sequence", state["tasks"][task_id]["attempts"]
-        )
-    )
-    log_reference = experience_log_reference(task_list["list_id"], task_id, attempt)
-    if task_paths:
-        violations = scope_errors(paths, task, config, task_file, root)
-        if violations:
-            fingerprint = diff_fingerprint(root, paths)
-            failure = "; ".join(violations)
-            record_failure(state, task_id, failure, fingerprint, immediate=True)
-            append_experience_record(
-                root,
-                task_list,
-                task_id=task_id,
-                title=task["title"],
-                attempt=attempt,
-                outcome="阻塞",
-                stage="中断恢复范围校验",
-                lessons=[],
-                failure=failure,
-                log_reference=log_reference,
-            )
-            atomic_write_json(state_path, state)
-            save_attempt_log(
-                logs_root,
-                task_list["list_id"],
-                task_id,
-                attempt,
-                {
-                    "task_id": task_id,
-                    "attempt": attempt,
-                    "status": "blocked-after-interruption",
-                    "failure": failure,
-                    "diff_fingerprint": fingerprint,
-                    "experience_recorded": True,
-                },
-            )
-            return True
-        passed, verification, failure = execute_commands(root, task["verify_commands"], config)
-        if passed:
-            append_experience_record(
-                root,
-                task_list,
-                task_id=task_id,
-                title=task["title"],
-                attempt=attempt,
-                outcome="中断后恢复成功",
-                stage="执行中断恢复",
-                lessons=[
-                    {
-                        "challenge": "上一次 Worker 执行被中断，但工作区保留了任务改动。",
-                        "detour": None,
-                        "root_cause": None,
-                        "resolution": "Coordinator 对现有改动重新执行任务验证并完成提交。",
-                        "takeaway": "中断后先检查并验证已有 diff，可以避免重复实现和丢失有效改动。",
-                    }
-                ],
-                log_reference=log_reference,
-            )
-            commit = complete_task(
-                root,
-                task_file,
-                task_list,
-                task,
-                state,
-                state_path,
-                config,
-                verification,
-            )
-            save_attempt_log(
-                logs_root,
-                task_list["list_id"],
-                task_id,
-                attempt,
-                {
-                    "task_id": task_id,
-                    "attempt": attempt,
-                    "status": "done-after-interruption",
-                    "commit": commit,
-                    "verification": verification,
-                    "experience_recorded": True,
-                },
-            )
-            print(f"DONE {task_id} {commit[:12]} recovered after interruption")
-            return True
-        fingerprint = diff_fingerprint(root, paths)
-        blocked = record_failure(state, task_id, failure or "verification failed", fingerprint)
-        append_experience_record(
-            root,
-            task_list,
-            task_id=task_id,
-            title=task["title"],
-            attempt=attempt,
-            outcome="阻塞" if blocked else "等待重试",
-            stage="中断恢复验证",
-            lessons=[],
-            failure=failure or "verification failed",
-            log_reference=log_reference,
-        )
-        atomic_write_json(state_path, state)
-        save_attempt_log(
-            logs_root,
-            task_list["list_id"],
-            task_id,
-            attempt,
-            {
-                "task_id": task_id,
-                "attempt": attempt,
-                "status": "blocked-after-interruption" if blocked else "retry-after-interruption",
-                "failure": failure,
-                "verification": verification,
-                "diff_fingerprint": fingerprint,
-                "experience_recorded": True,
-            },
-        )
-        if blocked:
-            print(f"BLOCKED {task_id}: {failure}")
-            return True
-    else:
-        item = state["tasks"][task_id]
-        item["status"] = "blocked" if item["attempts"] >= MAX_ATTEMPTS else "pending"
-        state["project_status"] = "blocked" if item["status"] == "blocked" else "executing"
-        state["active_task"] = task_id if item["status"] == "blocked" else None
-        failure = "上一次 Worker 执行被中断，且没有留下任务范围内的工作区改动"
-        item["last_failure"] = {
-            "summary": normalize_failure(failure),
-            "fingerprint": diff_fingerprint(root, paths),
-            "recorded_at": utc_now(),
+def result(
+    data: dict[str, Any],
+    exit_code: int = 0,
+    *,
+    error_code: str | None = None,
+    error_message: str | None = None,
+) -> CommandResult:
+    error = None
+    if error_code is not None:
+        error = {
+            "code": error_code,
+            "message": error_message or error_code,
+            "details": None,
         }
-        append_experience_record(
-            root,
-            task_list,
-            task_id=task_id,
-            title=task["title"],
-            attempt=attempt,
-            outcome="阻塞" if item["status"] == "blocked" else "等待重试",
-            stage="执行中断恢复",
-            lessons=[],
-            failure=failure,
-            log_reference=log_reference,
-        )
-        atomic_write_json(state_path, state)
-        save_attempt_log(
-            logs_root,
-            task_list["list_id"],
-            task_id,
-            attempt,
-            {
-                "task_id": task_id,
-                "attempt": attempt,
-                "status": "blocked-after-interruption"
-                if item["status"] == "blocked"
-                else "retry-after-interruption",
-                "failure": failure,
-                "diff_fingerprint": item["last_failure"]["fingerprint"],
-                "experience_recorded": True,
-            },
-        )
-    return True
-
-
-def print_init_summary(root: Path, result: dict[str, list[str]], *, git_initialized: bool) -> None:
-    print(f"loopsail 初始化目录：{root}")
-    if git_initialized:
-        print("git: initialized")
-    for label in ("created", "updated", "skipped"):
-        values = result[label]
-        print(f"{label}:")
-        if values:
-            for value in values:
-                print(f"  - {value}")
-        else:
-            print("  - (none)")
-
-
-def print_init_next_steps() -> None:
-    print("下一步：")
-    print("  1. 完善 CLAUDE.md 中的 TODO 项目规范。")
-    print("  2. 填写 TASKS.json 中的全部必填项。")
-    print("  3. 在 Claude Code 中运行 /loopsail:validate。")
+    return data, exit_code, error
 
 
 def create_initial_commit(root: Path, paths: list[str]) -> str:
@@ -1891,196 +1425,209 @@ def create_initial_commit(root: Path, paths: list[str]) -> str:
         identity = run_git(root, "var", variable, check=False)
         if identity.returncode != 0:
             raise LoopSailError(
-                "初始化文件已生成，但 Git 用户身份未配置，无法创建初始提交；"
-                "请配置 user.name 和 user.email 后手工提交"
+                "initialization files were created, but Git user.name/user.email are "
+                "not configured, so the initial commit could not be created"
             )
     try:
         run_git(root, "add", "--", *paths)
         run_git(root, "commit", "--only", "-m", INIT_COMMIT_MESSAGE, "--", *paths)
     except LoopSailError as exc:
         raise LoopSailError(
-            "初始化文件已生成，但初始提交失败；本次文件可能仍处于暂存状态："
-            f"{exc}"
+            f"initialization files were created but the initial commit failed: {exc}"
         ) from exc
     return run_git(root, "rev-parse", "--short", "HEAD").stdout.strip()
 
 
-def command_init(args: argparse.Namespace) -> int:
+def command_init(args: argparse.Namespace) -> CommandResult:
     start = Path.cwd().resolve()
     root = maybe_discover_project_root(start)
     git_initialized = False
     if root is None:
         if not args.yes:
-            if not stdin_is_interactive():
-                raise LoopSailError(
-                    "当前目录不是 Git 仓库；请先执行 git init，或使用 loopsail init --yes"
-                )
-            if not confirm(f"当前目录不是 Git 仓库，是否在 {start} 执行 git init？"):
-                raise LoopSailError("已取消初始化；未创建 Git 仓库或 loopsail 文件")
+            raise LoopSailError(
+                "current directory is not a Git repository; confirmation is required"
+            )
         run_process(["git", "init"], cwd=start, check=True)
         git_initialized = True
         root = discover_project_root(start)
 
     had_head = run_git(root, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
-    result = initialize_scaffold(root)
-    print_init_summary(root, result, git_initialized=git_initialized)
-
-    touched = result["touched"]
-    if not had_head and touched:
-        should_commit = args.yes
-        if not should_commit and stdin_is_interactive():
-            should_commit = confirm("当前仓库还没有提交，是否提交本次初始化文件？")
+    scaffold = initialize_scaffold(root)
+    commit: str | None = None
+    commit_skipped = False
+    if not had_head and scaffold["touched"]:
+        should_commit = bool(args.yes)
         if should_commit:
-            commit = create_initial_commit(root, touched)
-            print(f"commit: {commit} ({INIT_COMMIT_MESSAGE})")
+            commit = create_initial_commit(root, scaffold["touched"])
         else:
-            print("commit: skipped；请审阅后手工创建初始提交。")
+            commit_skipped = True
+    return result(
+        {
+            "schema_version": 2,
+            "kind": "init-report",
+            "project_root": str(root),
+            "git_initialized": git_initialized,
+            "created": scaffold["created"],
+            "updated": scaffold["updated"],
+            "preserved": scaffold["skipped"],
+            "commit": commit,
+            "commit_skipped": commit_skipped,
+            "next_action": "complete CLAUDE.md and TASKS.json, then run /loopsail:validate",
+            "at": utc_now(),
+        }
+    )
 
-    print_init_next_steps()
-    return 0
 
-
-def command_validate(args: argparse.Namespace) -> int:
+def command_validate(args: argparse.Namespace) -> CommandResult:
     root = discover_project_root()
     config, sources = load_config(root, args.runner_config)
-    _, task_list = load_task_input(args.task_list, root)
-    print(
-        json.dumps(
-            {
-                "valid": True,
-                "list_id": task_list["list_id"],
-                "tasks": len(task_list["tasks"]),
-                "config_sources": sources,
-                "launcher_kind": (
-                    "configured-prefix" if claude_launcher_overridden(config) else "active-profile"
-                ),
-                "worker_timeout_seconds": config["worker_timeout_seconds"],
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    task_file, task_list = load_task_input(args.task_list, root)
+    require_safe_experience_file(root)
+    return result(
+        {
+            "schema_version": 2,
+            "kind": "validation-report",
+            "valid": True,
+            "list_id": task_list["list_id"],
+            "task_file": task_file.relative_to(root).as_posix(),
+            "tasks": len(task_list["tasks"]),
+            "config_sources": sources,
+            "config": config,
+            "worker_agent": "loopsail:worker",
+            "at": utc_now(),
+        }
     )
-    return 0
 
 
-def command_doctor(args: argparse.Namespace) -> int:
+def command_doctor(args: argparse.Namespace) -> CommandResult:
     root = maybe_discover_project_root() or Path.cwd().resolve()
     config, sources = load_config(root, args.runner_config)
-    timeout = min(60, config["worker_timeout_seconds"])
-    env = claude_child_environment()
-    version_result = run_process(
-        claude_launcher_argv(config, "--version"),
-        cwd=root,
-        timeout=timeout,
-        env=env,
+    required = [
+        TOOL_ROOT / "scripts" / "loopsail.py",
+        TOOL_ROOT / "scripts" / "hook.py",
+        TOOL_ROOT / "scripts" / "guard.py",
+        TOOL_ROOT.parent.parent / "agents" / "worker.md",
+        TOOL_ROOT.parent.parent / "hooks" / "hooks.json",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise LoopSailError("plugin runtime files are missing: " + ", ".join(missing))
+    hooks = load_json(TOOL_ROOT.parent.parent / "hooks" / "hooks.json")
+    schemas: list[str] = []
+    for path in sorted(SCHEMA_DIR.glob("*.schema.json")):
+        schema = load_json(path)
+        if schema.get("$schema") != "http://json-schema.org/draft-07/schema#":
+            raise LoopSailError(
+                f"schema does not declare Draft-07: {path.name}",
+                code="schema_dialect_mismatch",
+            )
+        schemas.append(path.name)
+    return result(
+        {
+            "schema_version": 2,
+            "kind": "doctor-report",
+            "healthy": True,
+            "python": sys.version.split()[0],
+            "config_sources": sources,
+            "config": config,
+            "worker_agent": "loopsail:worker",
+            "hooks": sorted(hooks.get("hooks", {})),
+            "schemas": schemas,
+            "at": utc_now(),
+        }
     )
-    if version_result.returncode != 0:
-        raise LoopSailError(
-            "Claude launcher failed version check with exit code "
-            f"{version_result.returncode}"
-        )
-    version = (
-        version_result.stdout.strip().splitlines()
-        or version_result.stderr.strip().splitlines()
-        or ["ok"]
-    )[-1]
 
-    auth_result = run_process(
-        claude_launcher_argv(config, "auth", "status", "--json"),
-        cwd=root,
-        timeout=timeout,
-        env=env,
-    )
-    if auth_result.returncode != 0:
-        raise LoopSailError(
-            "Claude launcher failed authentication check with exit code "
-            f"{auth_result.returncode}"
-        )
-    try:
-        auth = parse_json_tail(auth_result.stdout)
-    except LoopSailError as exc:
-        raise LoopSailError("Claude authentication status was not valid JSON") from exc
-    if auth.get("loggedIn") is not True:
-        raise LoopSailError("Claude launcher is not authenticated")
-    auth_method = auth.get("authMethod")
-    api_provider = auth.get("apiProvider")
-    if auth_method is not None and not isinstance(auth_method, str):
-        raise LoopSailError("Claude authentication method was invalid")
-    if api_provider is not None and not isinstance(api_provider, str):
-        raise LoopSailError("Claude API provider was invalid")
 
-    overridden = claude_launcher_overridden(config)
-    print(
-        json.dumps(
+def status_report(
+    root: Path,
+    task_list: dict[str, Any],
+    state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    started = state is not None
+    if state is None:
+        branch = f"loopsail/{task_list['list_id'].lower()}"
+        project_status = "not_started"
+        active_task = None
+        active_request = None
+        final_verification = None
+        rows = [
             {
-                "healthy": True,
-                "config_sources": sources,
-                "launcher_kind": "configured-prefix" if overridden else "active-profile",
-                "launcher_overridden": overridden,
-                "claude_profile": active_claude_profile(),
-                "claude_version": version[-200:],
-                "authentication": {
-                    "logged_in": True,
-                    "method": auth_method[:100] if auth_method is not None else None,
-                    "provider": api_provider[:100] if api_provider is not None else None,
-                },
-            },
-            ensure_ascii=False,
-            indent=2,
+                "id": task["id"],
+                "title": task["title"],
+                "status": "pending",
+                "attempts": 0,
+                "attempt_sequence": 0,
+                "ai_retry_count": 0,
+                "commit": None,
+                "last_failure": None,
+                "definition_changed": False,
+            }
+            for task in task_list["tasks"]
+        ]
+    else:
+        branch = state["branch"]
+        project_status = state["project_status"]
+        active_task = state.get("active_task")
+        lease = state.get("active_request")
+        active_request = (
+            {
+                "request_id": lease["request_id"],
+                "task_id": lease["task_id"],
+                "attempt": lease["attempt"],
+                "agent_id": lease.get("agent_id"),
+                "result_captured": bool(lease.get("captured_at")),
+            }
+            if isinstance(lease, dict)
+            else None
         )
-    )
-    return 0
+        final_verification = state.get("final_verification")
+        rows = []
+        for task in task_list["tasks"]:
+            item = state["tasks"].get(task["id"], new_task_state(task))
+            rows.append(
+                {
+                    "id": task["id"],
+                    "title": task["title"],
+                    "status": item["status"],
+                    "attempts": int(item.get("attempts", 0)),
+                    "attempt_sequence": int(item.get("attempt_sequence", 0)),
+                    "ai_retry_count": int(item.get("ai_retry_count", 0)),
+                    "commit": item.get("commit"),
+                    "last_failure": item.get("last_failure"),
+                    "definition_changed": item["definition_hash"] != value_hash(task),
+                }
+            )
+    return {
+        "schema_version": 2,
+        "kind": "status-report",
+        "started": started,
+        "list_id": task_list["list_id"],
+        "project_status": project_status,
+        "branch": branch,
+        "active_task": active_task,
+        "active_request": active_request,
+        "final_verification": final_verification,
+        "tasks": rows,
+        "at": utc_now(),
+    }
 
 
-def command_status(args: argparse.Namespace) -> int:
+def command_status(args: argparse.Namespace) -> CommandResult:
     root = discover_project_root()
     load_config(root, args.runner_config)
     _, task_list = load_task_input(args.task_list, root)
     state_path, _, _ = state_paths(root, task_list["list_id"])
+    state: dict[str, Any] | None = None
     if state_path.is_file():
         state = load_json(state_path)
         validate_state(state, task_list)
-    else:
-        state = create_state(task_list, args.task_list.resolve(), root)
-    rows = []
-    for task in task_list["tasks"]:
-        item = state["tasks"].get(task["id"], new_task_state(task))
-        rows.append(
-            {
-                "id": task["id"],
-                "status": item["status"],
-                "attempts": item["attempts"],
-                "ai_retry_count": int(item.get("ai_retry_count", 0)),
-                "last_failure": (
-                    item.get("last_failure", {}).get("summary")
-                    if isinstance(item.get("last_failure"), dict)
-                    else None
-                ),
-                "definition_changed": item["definition_hash"] != value_hash(task),
-                "title": task["title"],
-            }
-        )
-    print(
-        json.dumps(
-            {
-                "list_id": task_list["list_id"],
-                "project_status": state["project_status"],
-                "branch": state["branch"],
-                "active_task": state.get("active_task"),
-                "final_verification": state.get("final_verification"),
-                "tasks": rows,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
+    return result(status_report(root, task_list, state))
 
 
-def command_retry(args: argparse.Namespace) -> int:
+def command_retry(args: argparse.Namespace) -> CommandResult:
     root = discover_project_root()
     _, task_list = load_task_input(args.task_list, root)
-    state_path, _, logs_root = state_paths(root, task_list["list_id"])
+    state_path, _, _ = state_paths(root, task_list["list_id"])
     actor = getattr(args, "actor", "human")
     if actor not in {"human", "ai"}:
         raise LoopSailError(f"invalid retry actor: {actor}")
@@ -2094,174 +1641,266 @@ def command_retry(args: argparse.Namespace) -> int:
         item = state["tasks"][args.task_id]
         if item["status"] != "blocked":
             raise LoopSailError(f"only a blocked task can be retried: {args.task_id}")
+        if state.get("active_request") is not None:
+            raise LoopSailError("cannot retry while an active request lease exists")
         ai_retry_count = int(item.get("ai_retry_count", 0))
         if actor == "ai" and ai_retry_count >= AI_RETRY_LIMIT:
             raise LoopSailError(
-                f"AI retry limit reached for {args.task_id}; "
-                "human confirmation is required through /loopsail:retry"
+                f"AI retry limit reached for {args.task_id}; human confirmation is required"
             )
         item["attempt_sequence"] = max(
-            int(item.get("attempt_sequence", 0)), int(item["attempts"])
+            int(item.get("attempt_sequence", 0)), int(item.get("attempts", 0))
         )
         item.update({"status": "pending", "attempts": 0, "updated_at": utc_now()})
         item["ai_retry_count"] = ai_retry_count + 1 if actor == "ai" else 0
         state["active_task"] = None
+        state["active_request"] = None
         state["project_status"] = "executing"
         state["updated_at"] = utc_now()
         atomic_write_json(state_path, state)
-        save_attempt_log(
-            logs_root,
-            task_list["list_id"],
-            args.task_id,
-            0,
-            {
-                "task_id": args.task_id,
-                "status": f"{actor}-retry",
-                "actor": actor,
-                "ai_retry_count": item["ai_retry_count"],
-                "reason": args.reason,
-                "at": utc_now(),
-            },
-        )
-    print(f"retry enabled for {args.task_id}")
-    return 0
+    return result(
+        {
+            "schema_version": 2,
+            "kind": "retry-report",
+            "list_id": task_list["list_id"],
+            "task_id": args.task_id,
+            "actor": actor,
+            "ai_retry_count": item["ai_retry_count"],
+            "reason": args.reason,
+            "next_action": "/loopsail:run-once",
+            "at": utc_now(),
+        }
+    )
 
 
-def slash_task_args(
-    *, actor: str | None = None, requested_task_id: str | None = None
-) -> argparse.Namespace:
-    root = discover_project_root()
-    values: dict[str, Any] = {
-        "runner_config": None,
-        "task_list": root / INIT_TASK_FILE,
+def task_step(state: dict[str, Any], task: dict[str, Any] | None) -> dict[str, Any] | None:
+    if task is None:
+        return None
+    item = state["tasks"][task["id"]]
+    failure = item.get("last_failure")
+    return {
+        "id": task["id"],
+        "title": task["title"],
+        "status": item["status"],
+        "attempts": int(item.get("attempts", 0)),
+        "attempt": int(item.get("attempt_sequence", 0)) or None,
+        "commit": item.get("commit"),
+        "failure": failure.get("summary") if isinstance(failure, dict) else None,
+        "ai_retry_count": int(item.get("ai_retry_count", 0)),
     }
-    if actor is not None:
-        _, task_list = load_task_input(root / INIT_TASK_FILE, root)
-        state_path, _, _ = state_paths(root, task_list["list_id"])
-        if not state_path.is_file():
-            raise LoopSailError("task list has not been started")
-        state = load_json(state_path)
-        validate_state(state, task_list)
-        active_task = state.get("active_task")
-        if state.get("project_status") != "blocked" or not active_task:
-            raise LoopSailError("there is no active blocked task to retry")
-        if not requested_task_id or not ID_RE.fullmatch(requested_task_id):
-            raise LoopSailError("retry requires one valid task ID")
-        if requested_task_id != active_task:
-            raise LoopSailError(
-                f"only the active blocked task can be retried: {active_task}"
-            )
-        item = state["tasks"][active_task]
-        failure = item.get("last_failure")
-        failure_summary = (
-            failure.get("summary") if isinstance(failure, dict) else "recorded blocker"
-        )
-        values.update(
-            {
-                "task_id": active_task,
-                "actor": actor,
-                "reason": (
-                    "AI supervisor classified the recorded blocker as transient after "
-                    f"reviewing the public report and attempt log: {failure_summary}"
-                    if actor == "ai"
-                    else "human confirmed retry after reviewing the reported blocker: "
-                    f"{failure_summary}"
-                ),
-            }
-        )
-    return argparse.Namespace(**values)
 
 
-def command_slash(args: argparse.Namespace) -> int:
-    action = args.action
-    if action not in {"retry-ai", "retry-human"} and args.task_id is not None:
-        raise LoopSailError(f"slash action {action} does not accept arguments")
-    if action == "doctor":
-        return command_doctor(argparse.Namespace(runner_config=None))
-    if action == "init-check":
-        start = Path.cwd().resolve()
-        root = maybe_discover_project_root(start)
-        has_head = bool(
-            root
-            and run_git(root, "rev-parse", "--verify", "HEAD", check=False).returncode == 0
-        )
-        print(
-            json.dumps(
-                {
-                    "directory": str(start),
-                    "git_repository": root is not None,
-                    "project_root": str(root) if root else None,
-                    "has_head": has_head,
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
-        return 0
-    if action in {"init", "init-confirmed"}:
-        return command_init(
-            argparse.Namespace(yes=action == "init-confirmed", runner_config=None)
-        )
-    if action == "validate":
-        return command_validate(slash_task_args())
-    if action == "status":
-        return command_status(slash_task_args())
-    if action in {"run-once", "run-all"}:
-        run_args = slash_task_args()
-        run_args.once = action == "run-once"
-        return command_run(run_args)
-    if action in {"retry-ai", "retry-human"}:
-        actor = "ai" if action == "retry-ai" else "human"
-        return command_retry(
-            slash_task_args(actor=actor, requested_task_id=args.task_id)
-        )
-    raise LoopSailError(f"unknown slash action: {action}")
+def step_report(
+    task_list: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    action: str,
+    performed: bool,
+    task: dict[str, Any] | None = None,
+    lease: dict[str, Any] | None = None,
+    blocked_reason: str | None = None,
+    next_action: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "kind": "step-report",
+        "action": action,
+        "performed": performed,
+        "list_id": task_list["list_id"],
+        "branch": state["branch"],
+        "project_status": state["project_status"],
+        "request_id": lease.get("request_id") if lease else None,
+        "request_path": lease.get("request_path") if lease else None,
+        "worker_agent": "loopsail:worker" if action == "spawn_worker" else None,
+        "task": task_step(state, task),
+        "blocked_reason": blocked_reason,
+        "tasks_remaining": sum(
+            state["tasks"][item["id"]]["status"] not in {"done", "superseded"}
+            for item in task_list["tasks"]
+        ),
+        "next_action": next_action,
+        "at": utc_now(),
+    }
 
 
-def run_final_verification(
+def write_step_report(state_path: Path, report: dict[str, Any]) -> None:
+    atomic_write_json(state_path.parent / STEP_REPORT_FILE, report)
+
+
+def attempt_paths(
+    list_id: str, task_id: str, attempt: int, request_id: str
+) -> tuple[str, str, str]:
+    stem = f"{task_id}-attempt-{attempt}-{request_id}"
+    return (
+        f".loopsail/input/{list_id}/{stem}.json",
+        f".loopsail/output/{list_id}/{stem}.json",
+        f".loopsail/logs/{list_id}/{stem}.events.jsonl",
+    )
+
+
+def worker_request(
+    root: Path,
+    task_file: Path,
+    task_list: dict[str, Any],
+    task: dict[str, Any],
+    item: dict[str, Any],
+    config: dict[str, Any],
+    request_id: str,
+    attempt: int,
+    request_path: str,
+) -> dict[str, Any]:
+    protected = list(
+        dict.fromkeys(
+            [
+                *PROTECTED_PATTERNS,
+                LESSONS_FILE,
+                task_file.resolve().relative_to(root).as_posix(),
+                *config["protected_paths"],
+            ]
+        )
+    )
+    return {
+        "schema_version": 2,
+        "kind": "worker-request",
+        "request_id": request_id,
+        "list_id": task_list["list_id"],
+        "project": task_list["project"],
+        "branch": f"loopsail/{task_list['list_id'].lower()}",
+        "task_id": task["id"],
+        "attempt": attempt,
+        "task": task,
+        "previous_failure": item.get("last_failure"),
+        "policy": {
+            "allowed_paths": task.get("allowed_paths") or [],
+            "protected_paths": protected,
+            "request_path": request_path,
+        },
+        "created_at": utc_now(),
+    }
+
+
+def attempt_log_path(root: Path, list_id: str, task_id: str, attempt: int) -> Path:
+    return root / ".loopsail" / "logs" / list_id / f"{task_id}-attempt-{attempt}.json"
+
+
+def write_attempt_log(
+    root: Path,
+    *,
+    lease: dict[str, Any],
+    status: str,
+    failure_code: str | None,
+    failure: str | None,
+    actual_diff: list[str],
+    fingerprint: str,
+    verification: list[dict[str, Any]],
+    commit: str | None,
+    experience_recorded: bool,
+) -> str:
+    relative = (
+        Path(".loopsail")
+        / "logs"
+        / lease["list_id"]
+        / f"{lease['task_id']}-attempt-{lease['attempt']}.json"
+    ).as_posix()
+    payload = {
+        "schema_version": 2,
+        "kind": "attempt-log",
+        "request_id": lease["request_id"],
+        "list_id": lease["list_id"],
+        "task_id": lease["task_id"],
+        "attempt": lease["attempt"],
+        "agent_id": lease.get("agent_id"),
+        "status": status,
+        "failure_code": failure_code,
+        "failure": failure,
+        "actual_diff": actual_diff,
+        "diff_fingerprint": fingerprint,
+        "worker_result_path": lease.get("output_path"),
+        "event_log_path": lease.get("event_log_path"),
+        "verification": verification,
+        "commit": commit,
+        "experience_recorded": experience_recorded,
+        "at": utc_now(),
+    }
+    atomic_write_json(root / relative, payload)
+    return relative
+
+
+def record_orphaned_lease(
+    root: Path,
+    task_file: Path,
+    task_list: dict[str, Any],
+    state: dict[str, Any],
+    state_path: Path,
+    task: dict[str, Any],
+    lease: dict[str, Any],
+) -> dict[str, Any]:
+    paths = changed_paths(root)
+    fingerprint = diff_fingerprint(root, paths)
+    message = "active worker request ended without a captured result"
+    record_failure(state, task["id"], message, fingerprint, immediate=True)
+    state["active_request"] = None
+    state["last_finalized_request"] = {
+        "request_id": lease["request_id"],
+        "task_id": task["id"],
+        "attempt": lease["attempt"],
+        "status": "blocked",
+        "at": utc_now(),
+    }
+    experience_recorded = False
+    if not experience_file_changed(root, lease["experience_hash"]):
+        experience_recorded = append_experience_record(
+            root,
+            task_list,
+            task_id=task["id"],
+            title=task["title"],
+            attempt=lease["attempt"],
+            outcome="阻塞",
+            stage="Agent 中断恢复",
+            lessons=[],
+            failure=message,
+            log_reference=experience_log_reference(
+                task_list["list_id"], task["id"], lease["attempt"]
+            ),
+        )
+    write_attempt_log(
+        root,
+        lease=lease,
+        status="blocked",
+        failure_code="orphaned_attempt_lease",
+        failure=message,
+        actual_diff=paths,
+        fingerprint=fingerprint,
+        verification=[],
+        commit=None,
+        experience_recorded=experience_recorded,
+    )
+    state["updated_at"] = utc_now()
+    atomic_write_json(state_path, state)
+    return step_report(
+        task_list,
+        state,
+        action="blocked",
+        performed=True,
+        task=task,
+        blocked_reason=message,
+        next_action=f"/loopsail:retry {task['id']}",
+    )
+
+
+def run_final_verification_v2(
     root: Path,
     task_list: dict[str, Any],
     state: dict[str, Any],
     state_path: Path,
     snapshot_path: Path,
-    logs_root: Path,
     config: dict[str, Any],
-) -> tuple[bool, str | None, list[dict[str, Any]]]:
-    final_attempt = int(state.get("final_verification_attempts", 0)) + 1
+) -> tuple[bool, str | None]:
+    attempt = int(state.get("final_verification_attempts", 0)) + 1
     passed, records, failure = execute_commands(
         root, task_list["final_verify_commands"], config
     )
-    if not passed:
-        log_reference = experience_log_reference(
-            task_list["list_id"], "FINAL", final_attempt
-        )
-        append_experience_record(
-            root,
-            task_list,
-            task_id="FINAL",
-            title="最终验证",
-            attempt=final_attempt,
-            outcome="最终验证阻塞",
-            stage="最终验证",
-            lessons=[],
-            failure=failure or "final verification failed",
-            log_reference=log_reference,
-        )
-        save_attempt_log(
-            logs_root,
-            task_list["list_id"],
-            "FINAL",
-            final_attempt,
-            {
-                "task_id": "FINAL",
-                "attempt": final_attempt,
-                "status": "blocked",
-                "failure": failure,
-                "verification": records,
-                "experience_recorded": True,
-            },
-        )
-    state["final_verification_attempts"] = final_attempt
+    state["final_verification_attempts"] = attempt
     state["final_verification"] = {
         "status": "passed" if passed else "failed",
         "commands": records,
@@ -2270,343 +1909,601 @@ def run_final_verification(
     }
     state["project_status"] = "complete" if passed else "blocked"
     state["active_task"] = None
+    state["active_request"] = None
+    experience_recorded = False
+    if not passed:
+        experience_recorded = append_experience_record(
+            root,
+            task_list,
+            task_id="FINAL",
+            title="最终验证",
+            attempt=attempt,
+            outcome="最终验证阻塞",
+            stage="最终验证",
+            lessons=[],
+            failure=failure or "final verification failed",
+            log_reference=experience_log_reference(
+                task_list["list_id"], "FINAL", attempt
+            ),
+        )
+    paths = changed_paths(root)
+    write_attempt_log(
+        root,
+        lease={
+            "request_id": f"final-{task_list['list_id']}-{attempt}",
+            "list_id": task_list["list_id"],
+            "task_id": "FINAL",
+            "attempt": attempt,
+            "agent_id": None,
+            "output_path": None,
+            "event_log_path": None,
+        },
+        status="done" if passed else "blocked",
+        failure_code=None if passed else "final_verification_failed",
+        failure=failure,
+        actual_diff=paths,
+        fingerprint=diff_fingerprint(root, paths),
+        verification=records,
+        commit=None,
+        experience_recorded=experience_recorded,
+    )
     state["updated_at"] = utc_now()
     atomic_write_json(state_path, state)
     atomic_write_json(snapshot_path, task_list)
-    return passed, failure, records
+    return passed, failure
 
 
-def step_task_report(
-    root: Path,
-    task_list: dict[str, Any],
-    state: dict[str, Any],
-    task_id: str | None,
-) -> dict[str, Any] | None:
-    if task_id is None:
-        return None
-    task = task_map(task_list).get(task_id)
-    item = state["tasks"].get(task_id)
-    if task is None or item is None:
-        return None
-    attempt_value = int(item.get("attempt_sequence", item.get("attempts", 0)))
-    attempt = attempt_value if attempt_value > 0 else None
-    attempt_log = (
-        experience_log_reference(task_list["list_id"], task_id, attempt)
-        if attempt is not None
-        else None
-    )
-    last_failure = item.get("last_failure")
-    failure = last_failure.get("summary") if isinstance(last_failure, dict) else None
-    ai_retry_count = int(item.get("ai_retry_count", 0))
-    return {
-        "id": task_id,
-        "title": task["title"],
-        "status": item["status"],
-        "attempts": int(item.get("attempts", 0)),
-        "attempt": attempt,
-        "commit": item.get("commit"),
-        "failure": failure,
-        "attempt_log": attempt_log,
-        "ai_retry_count": ai_retry_count,
-        "ai_retries_remaining": max(0, AI_RETRY_LIMIT - ai_retry_count),
-    }
-
-
-def step_experience_records(root: Path, reference: str | None) -> list[str]:
-    if reference is None:
-        return []
-    path = root / reference
-    if not path.is_file():
-        return []
-    try:
-        payload = load_json(path)
-    except LoopSailError:
-        return []
-    return [reference] if payload.get("experience_recorded") is True else []
-
-
-def build_step_report(
-    root: Path,
-    task_list: dict[str, Any],
-    state: dict[str, Any],
-    *,
-    kind: str,
-    performed: bool,
-    exit_code: int,
-    task_id: str | None = None,
-    blocked_reason: str | None = None,
-    experience_records: list[str] | None = None,
-) -> dict[str, Any]:
-    if blocked_reason is None and state["project_status"] == "blocked":
-        active_task = state.get("active_task")
-        if active_task is not None:
-            active_state = state["tasks"].get(active_task, {})
-            failure = active_state.get("last_failure")
-            if isinstance(failure, dict):
-                blocked_reason = failure.get("summary")
-        if blocked_reason is None:
-            final_verification = state.get("final_verification")
-            if isinstance(final_verification, dict):
-                blocked_reason = final_verification.get("failure")
-
-    next_task = None
-    if state["project_status"] == "executing" and not all_tasks_finished(task_list, state):
-        ready = ready_task(task_list, state)
-        if ready is not None:
-            next_task = {"id": ready["id"], "title": ready["title"]}
-
-    final_report = None
-    final_verification = state.get("final_verification")
-    if isinstance(final_verification, dict):
-        final_report = {
-            "status": final_verification.get("status"),
-            "failure": final_verification.get("failure"),
-        }
-
-    return {
-        "schema_version": 1,
-        "kind": kind,
-        "performed": performed,
-        "list_id": task_list["list_id"],
-        "branch": state["branch"],
-        "project_status": state["project_status"],
-        "exit_code": exit_code,
-        "task": step_task_report(root, task_list, state, task_id),
-        "blocked_reason": blocked_reason,
-        "next_ready_task": next_task,
-        "tasks_remaining": sum(
-            state["tasks"][task["id"]]["status"] not in {"done", "superseded"}
-            for task in task_list["tasks"]
-        ),
-        "final_verification": final_report,
-        "experience_records": experience_records or [],
-        "at": utc_now(),
-    }
-
-
-def write_step_report(state_path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    atomic_write_json(state_path.parent / STEP_REPORT_FILE, report)
-    return report
-
-
-def run_step(
-    root: Path,
-    task_file: Path,
-    task_list: dict[str, Any],
-    state: dict[str, Any],
-    state_path: Path,
-    snapshot_path: Path,
-    logs_root: Path,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    if state["project_status"] == "complete":
-        return write_step_report(
-            state_path,
-            build_step_report(
-                root,
-                task_list,
-                state,
-                kind="already-complete",
-                performed=False,
-                exit_code=0,
-            ),
-        )
-
-    if state["project_status"] == "blocked":
-        return write_step_report(
-            state_path,
-            build_step_report(
-                root,
-                task_list,
-                state,
-                kind="blocked",
-                performed=False,
-                exit_code=2,
-                task_id=state.get("active_task"),
-            ),
-        )
-
-    active_task = state.get("active_task")
-    if active_task and state["tasks"].get(active_task, {}).get("status") == "running":
-        resume_running_task(
-            root, task_file, task_list, state, state_path, logs_root, config
-        )
-        task_report = step_task_report(root, task_list, state, active_task)
-        attempt_log = task_report["attempt_log"] if task_report is not None else None
-        exit_code = 2 if state["project_status"] == "blocked" else EXIT_PROGRESSED
-        return write_step_report(
-            state_path,
-            build_step_report(
-                root,
-                task_list,
-                state,
-                kind="resume",
-                performed=True,
-                exit_code=exit_code,
-                task_id=active_task,
-                experience_records=step_experience_records(root, attempt_log),
-            ),
-        )
-
-    if not all_tasks_finished(task_list, state):
-        task = ready_task(task_list, state)
-        if task is None:
-            pending = [
-                item["id"]
-                for item in task_list["tasks"]
-                if state["tasks"][item["id"]]["status"] == "pending"
-            ]
-            reason = f"no runnable task; pending tasks: {', '.join(pending)}"
-            return write_step_report(
-                state_path,
-                build_step_report(
-                    root,
-                    task_list,
-                    state,
-                    kind="idle",
-                    performed=False,
-                    exit_code=EXIT_IDLE,
-                    blocked_reason=reason,
-                ),
-            )
-        run_one_attempt(
-            root,
-            task_file,
-            task_list,
-            task,
-            state,
-            state_path,
-            logs_root,
-            config,
-        )
-        task_report = step_task_report(root, task_list, state, task["id"])
-        attempt_log = task_report["attempt_log"] if task_report is not None else None
-        exit_code = 2 if state["project_status"] == "blocked" else EXIT_PROGRESSED
-        return write_step_report(
-            state_path,
-            build_step_report(
-                root,
-                task_list,
-                state,
-                kind="attempt",
-                performed=True,
-                exit_code=exit_code,
-                task_id=task["id"],
-                experience_records=step_experience_records(root, attempt_log),
-            ),
-        )
-
-    passed, failure, _ = run_final_verification(
-        root, task_list, state, state_path, snapshot_path, logs_root, config
-    )
-    final_attempt = int(state.get("final_verification_attempts", 0))
-    final_log = (
-        experience_log_reference(task_list["list_id"], "FINAL", final_attempt)
-        if not passed
-        else None
-    )
-    if not passed:
-        print(f"BLOCKED final verification: {failure}")
-    else:
-        print(f"COMPLETE {task_list['list_id']} on {state['branch']}")
-    return write_step_report(
-        state_path,
-        build_step_report(
-            root,
-            task_list,
-            state,
-            kind="final-verification",
-            performed=True,
-            exit_code=0 if passed else 2,
-            experience_records=step_experience_records(root, final_log),
-        ),
-    )
-
-
-def command_run(args: argparse.Namespace) -> int:
+def prepare_step(args: argparse.Namespace) -> CommandResult:
     root = discover_project_root()
     config, _ = load_config(root, args.runner_config)
     task_file, task_list = load_task_input(args.task_list, root)
     require_safe_experience_file(root)
-    once = getattr(args, "once", False)
     with project_lock(root):
-        state, state_path, snapshot_path, logs_root, _ = initialize_or_load_state(
+        expected_state_path, _, _ = state_paths(root, task_list["list_id"])
+        for other_path in sorted((root / ".loopsail" / "runs").glob("*/state.json")):
+            if other_path == expected_state_path:
+                continue
+            other = load_json(other_path)
+            if other.get("schema_version") == 2 and isinstance(
+                other.get("active_request"), dict
+            ):
+                raise LoopSailError(
+                    "another task list already owns an active attempt lease",
+                    code="concurrent_attempt_lease",
+                )
+        state, state_path, snapshot_path, _, _ = initialize_or_load_state(
             root, task_file, task_list
         )
-        while True:
-            report = run_step(
-                root,
-                task_file,
+        if state["project_status"] == "complete":
+            report = step_report(
                 task_list,
                 state,
-                state_path,
-                snapshot_path,
-                logs_root,
-                config,
+                action="already_complete",
+                performed=False,
+                next_action=None,
             )
-            if once:
-                print(json.dumps(report, ensure_ascii=False))
-                return int(report["exit_code"])
-            if report["kind"] == "already-complete":
-                print(f"COMPLETE {task_list['list_id']} (already complete)")
-                return 0
-            if report["kind"] == "blocked":
-                task_id = state.get("active_task") or "final verification"
+            write_step_report(state_path, report)
+            return result(report)
+        if state["project_status"] == "blocked":
+            task = task_map(task_list).get(state.get("active_task"))
+            failure = (
+                state["tasks"][task["id"]].get("last_failure")
+                if task is not None
+                else state.get("final_verification")
+            )
+            reason = (
+                failure.get("summary") or failure.get("failure")
+                if isinstance(failure, dict)
+                else "run is blocked"
+            )
+            report = step_report(
+                task_list,
+                state,
+                action="blocked",
+                performed=False,
+                task=task,
+                blocked_reason=reason,
+                next_action=f"/loopsail:retry {task['id']}" if task else None,
+            )
+            write_step_report(state_path, report)
+            return result(
+                report, 2, error_code="run_blocked", error_message=reason
+            )
+
+        lease = state.get("active_request")
+        if isinstance(lease, dict):
+            task = task_map(task_list).get(lease.get("task_id"))
+            if task is None:
                 raise LoopSailError(
-                    f"run is blocked at {task_id}; update the list or use "
-                    f"/loopsail:retry {task_id}"
+                    "active request task is absent from TASKS.json",
+                    code="task_input_changed",
                 )
-            if report["kind"] == "idle":
-                raise LoopSailError(str(report["blocked_reason"]))
-            if report["exit_code"] in {0, 2}:
-                return int(report["exit_code"])
+            if (root / lease["output_path"]).is_file():
+                report = step_report(
+                    task_list,
+                    state,
+                    action="finalize_pending",
+                    performed=False,
+                    task=task,
+                    lease=lease,
+                    next_action="run finalize-step before spawning another worker",
+                )
+                write_step_report(state_path, report)
+                return result(report, EXIT_PROGRESSED)
+            report = record_orphaned_lease(
+                root, task_file, task_list, state, state_path, task, lease
+            )
+            write_step_report(state_path, report)
+            return result(
+                report,
+                2,
+                error_code="orphaned_attempt_lease",
+                error_message=str(report["blocked_reason"]),
+            )
+
+        if all_tasks_finished(task_list, state):
+            passed, failure = run_final_verification_v2(
+                root, task_list, state, state_path, snapshot_path, config
+            )
+            report = step_report(
+                task_list,
+                state,
+                action="complete" if passed else "blocked",
+                performed=True,
+                blocked_reason=failure,
+                next_action=None,
+            )
+            write_step_report(state_path, report)
+            if passed:
+                return result(report)
+            return result(
+                report,
+                2,
+                error_code="final_verification_failed",
+                error_message=failure or "final verification failed",
+            )
+
+        task = ready_task(task_list, state)
+        if task is None:
+            report = step_report(
+                task_list,
+                state,
+                action="idle",
+                performed=False,
+                blocked_reason="no dependency-ready task exists",
+                next_action="/loopsail:status",
+            )
+            write_step_report(state_path, report)
+            return result(report, EXIT_IDLE)
+
+        item = state["tasks"][task["id"]]
+        item["attempts"] = int(item.get("attempts", 0)) + 1
+        item["attempt_sequence"] = max(
+            int(item.get("attempt_sequence", 0)) + 1, item["attempts"]
+        )
+        attempt = item["attempt_sequence"]
+        request_id = uuid.uuid4().hex
+        request_path, output_path, event_log_path = attempt_paths(
+            task_list["list_id"], task["id"], attempt, request_id
+        )
+        request = worker_request(
+            root,
+            task_file,
+            task_list,
+            task,
+            item,
+            config,
+            request_id,
+            attempt,
+            request_path,
+        )
+        request_target = root / request_path
+        if request_target.exists():
+            raise LoopSailError("immutable worker request path already exists")
+        atomic_write_json(request_target, request)
+        lease = {
+            "request_id": request_id,
+            "list_id": task_list["list_id"],
+            "task_id": task["id"],
+            "attempt": attempt,
+            "request_path": request_path,
+            "output_path": output_path,
+            "event_log_path": event_log_path,
+            "task_input_hash": file_hash(task_file),
+            "task_definition_hash": value_hash(task),
+            "experience_hash": experience_file_hash(root),
+            "head_commit": run_git(root, "rev-parse", "HEAD").stdout.strip(),
+            "index_hash": git_index_hash(root),
+            "agent_id": None,
+            "session_id": None,
+            "started_at": None,
+            "captured_at": None,
+            "correction_used": False,
+            "last_protocol_error": None,
+            "protocol_failure": False,
+            "result_status": None,
+            "event_sequence": 0,
+            "event_truncated": False,
+            "event_log_max_bytes": config["event_log_max_bytes"],
+            "fatal_error": None,
+            "created_at": utc_now(),
+        }
+        item["status"] = "running"
+        item["updated_at"] = utc_now()
+        state["active_task"] = task["id"]
+        state["active_request"] = lease
+        state["updated_at"] = utc_now()
+        atomic_write_json(state_path, state)
+        atomic_write_json(snapshot_path, task_list)
+        report = step_report(
+            task_list,
+            state,
+            action="spawn_worker",
+            performed=True,
+            task=task,
+            lease=lease,
+            next_action=(
+                "invoke Agent with subagent_type loopsail:worker and "
+                "run_in_background=false, then always run finalize-step"
+            ),
+        )
+        write_step_report(state_path, report)
+        return result(report, EXIT_PROGRESSED)
+
+
+def failure_stage(code: str) -> str:
+    return {
+        "worker_result_missing": "Agent 结果捕获",
+        "worker_protocol_failure": "Agent 输出协议",
+        "agent_binding_error": "Agent 绑定校验",
+        "task_input_changed": "任务清单安全校验",
+        "experience_changed": "经验文件安全校验",
+        "scope_violation": "修改范围校验",
+        "worker_blocked": "Worker 主动阻塞",
+        "verification_failed": "任务验证",
+        "commit_failed": "任务提交",
+        "git_state_changed": "Git 安全校验",
+    }.get(code, "Coordinator 验收")
+
+
+def finalize_step(args: argparse.Namespace) -> CommandResult:
+    root = discover_project_root()
+    config, _ = load_config(root, args.runner_config)
+    task_file, task_list = load_task_input(args.task_list, root)
+    state_path, _, _ = state_paths(root, task_list["list_id"])
+    with project_lock(root):
+        if not state_path.is_file():
+            raise LoopSailError("task list has not been started")
+        state = load_json(state_path)
+        validate_state(state, task_list)
+        lease = state.get("active_request")
+        if not isinstance(lease, dict):
+            previous = state.get("last_finalized_request")
+            if isinstance(previous, dict):
+                task = task_map(task_list).get(previous.get("task_id"))
+                report = step_report(
+                    task_list,
+                    state,
+                    action="finalized",
+                    performed=False,
+                    task=task,
+                    next_action="/loopsail:run-once",
+                )
+                write_step_report(state_path, report)
+                return result(report, EXIT_PROGRESSED)
+            raise LoopSailError(
+                "there is no active worker request to finalize",
+                code="no_active_request",
+            )
+        task = task_map(task_list).get(lease.get("task_id"))
+        if task is None:
+            raise LoopSailError(
+                "active request task is absent from TASKS.json",
+                code="task_input_changed",
+            )
+        item = state["tasks"][task["id"]]
+        output_path = root / lease["output_path"]
+        worker_result: dict[str, Any] | None = None
+        failure: str | None = None
+        failure_code: str | None = None
+        immediate = False
+        verification: list[dict[str, Any]] = []
+        actual_diff = changed_paths(root)
+        fingerprint = diff_fingerprint(root, actual_diff)
+        experience_integrity = not experience_file_changed(
+            root, lease["experience_hash"]
+        )
+
+        if (
+            run_git(root, "rev-parse", "HEAD").stdout.strip() != lease["head_commit"]
+            or git_index_hash(root) != lease["index_hash"]
+        ):
+            failure_code = "git_state_changed"
+            failure = "worker changed Git HEAD or the index; only Coordinator may mutate Git"
+            immediate = True
+        elif lease.get("fatal_error"):
+            failure_code = "agent_binding_error"
+            failure = str(lease["fatal_error"])
+            immediate = True
+        elif not output_path.is_file():
+            failure_code = "worker_result_missing"
+            failure = "worker agent ended without a captured worker-result"
+        else:
+            try:
+                worker_result = validate_worker_result_v2(
+                    load_json(output_path), binding=lease
+                )
+            except (ProtocolError, LoopSailError) as exc:
+                failure_code = "worker_protocol_failure"
+                failure = str(exc)
+                immediate = True
+
+        if failure is None and (
+            not isinstance(lease.get("agent_id"), str) or not lease.get("captured_at")
+        ):
+            failure_code = "agent_binding_error"
+            failure = "captured result is not bound to a started worker agent"
+            immediate = True
+        if failure is None and (
+            not task_file.is_file()
+            or file_hash(task_file) != lease["task_input_hash"]
+            or value_hash(task) != lease["task_definition_hash"]
+        ):
+            failure_code = "task_input_changed"
+            failure = "worker changed the protected task-list input"
+            immediate = True
+        if failure is None and not experience_integrity:
+            failure_code = "experience_changed"
+            failure = f"worker changed the protected experience log: {LESSONS_FILE}"
+            immediate = True
+        if failure is None and lease.get("protocol_failure"):
+            failure_code = "worker_protocol_failure"
+            failure = worker_result["blocker"] if worker_result else "worker protocol failed"
+            immediate = True
+        if failure is None and worker_result and worker_result["status"] == "blocked":
+            failure_code = "worker_blocked"
+            failure = worker_result["blocker"]
+            immediate = True
+        if failure is None:
+            violations = scope_errors(actual_diff, task, config, task_file, root)
+            if violations:
+                failure_code = "scope_violation"
+                failure = "; ".join(violations)
+                immediate = True
+        if failure is None:
+            passed, verification, failure = execute_commands(
+                root, task["verify_commands"], config
+            )
+            if not passed:
+                failure_code = "verification_failed"
+
+        experience_recorded = False
+        commit: str | None = None
+        if failure is None and worker_result is not None:
+            experience_recorded = append_experience_record(
+                root,
+                task_list,
+                task_id=task["id"],
+                title=task["title"],
+                attempt=lease["attempt"],
+                outcome="验证通过",
+                stage="子 Agent 实现与 Coordinator 验证",
+                lessons=worker_result["lessons"],
+                log_reference=experience_log_reference(
+                    task_list["list_id"], task["id"], lease["attempt"]
+                ),
+            )
+            try:
+                commit = complete_task(
+                    root,
+                    task_file,
+                    task_list,
+                    task,
+                    state,
+                    state_path,
+                    config,
+                    verification,
+                )
+            except LoopSailError as exc:
+                failure_code = "commit_failed"
+                failure = str(exc)
+                immediate = True
+
+        blocked = False
+        if failure is not None:
+            blocked = record_failure(
+                state,
+                task["id"],
+                failure,
+                fingerprint,
+                immediate=immediate,
+            )
+            if experience_integrity:
+                try:
+                    experience_recorded = append_experience_record(
+                        root,
+                        task_list,
+                        task_id=task["id"],
+                        title=task["title"],
+                        attempt=lease["attempt"],
+                        outcome="阻塞" if blocked else "等待重试",
+                        stage=failure_stage(failure_code or "coordinator_failure"),
+                        lessons=worker_result["lessons"] if worker_result else [],
+                        failure=failure,
+                        log_reference=experience_log_reference(
+                            task_list["list_id"], task["id"], lease["attempt"]
+                        ),
+                    )
+                except LoopSailError as exc:
+                    failure_code = "experience_changed"
+                    failure = f"experience recording failed: {exc}"
+                    blocked = record_failure(
+                        state, task["id"], failure, fingerprint, immediate=True
+                    )
+        state["active_request"] = None
+        state["last_finalized_request"] = {
+            "request_id": lease["request_id"],
+            "task_id": task["id"],
+            "attempt": lease["attempt"],
+            "status": "done" if commit else ("blocked" if blocked else "retry"),
+            "at": utc_now(),
+        }
+        state["updated_at"] = utc_now()
+        atomic_write_json(state_path, state)
+        write_attempt_log(
+            root,
+            lease=lease,
+            status="done" if commit else ("blocked" if blocked else "retry"),
+            failure_code=failure_code,
+            failure=failure,
+            actual_diff=actual_diff,
+            fingerprint=fingerprint,
+            verification=verification,
+            commit=commit,
+            experience_recorded=experience_recorded,
+        )
+        report = step_report(
+            task_list,
+            state,
+            action="blocked" if blocked else "finalized",
+            performed=True,
+            task=task,
+            blocked_reason=failure if blocked else None,
+            next_action=(
+                f"/loopsail:retry {task['id']}"
+                if blocked
+                else "/loopsail:run-once"
+            ),
+        )
+        write_step_report(state_path, report)
+        if blocked:
+            return result(
+                report,
+                2,
+                error_code=failure_code or "run_blocked",
+                error_message=failure or "run blocked",
+            )
+        return result(report, EXIT_PROGRESSED)
+
+
+def slash_args(
+    *, actor: str | None = None, requested_task_id: str | None = None
+) -> argparse.Namespace:
+    root = discover_project_root()
+    values: dict[str, Any] = {
+        "runner_config": None,
+        "task_list": root / INIT_TASK_FILE,
+    }
+    if actor is not None:
+        if not requested_task_id or not ID_RE.fullmatch(requested_task_id):
+            raise LoopSailError("retry requires exactly one valid task ID")
+        _, task_list = load_task_input(root / INIT_TASK_FILE, root)
+        state_path, _, _ = state_paths(root, task_list["list_id"])
+        if not state_path.is_file():
+            raise LoopSailError("task list has not been started")
+        state = load_json(state_path)
+        validate_state(state, task_list)
+        if state.get("project_status") != "blocked":
+            raise LoopSailError("there is no blocked task to retry")
+        if state.get("active_task") != requested_task_id:
+            raise LoopSailError(
+                f"only the active blocked task can be retried: {state.get('active_task')}"
+            )
+        values.update(
+            {
+                "task_id": requested_task_id,
+                "actor": actor,
+                "reason": (
+                    "AI supervisor classified the recorded failure as transient"
+                    if actor == "ai"
+                    else "human explicitly confirmed retry"
+                ),
+            }
+        )
+    return argparse.Namespace(**values)
+
+
+def command_init_check(_: argparse.Namespace) -> CommandResult:
+    start = Path.cwd().resolve()
+    root = maybe_discover_project_root(start)
+    has_head = bool(
+        root
+        and run_git(root, "rev-parse", "--verify", "HEAD", check=False).returncode
+        == 0
+    )
+    return result(
+        {
+            "schema_version": 2,
+            "kind": "init-check-report",
+            "directory": str(start),
+            "git_repository": root is not None,
+            "project_root": str(root) if root else None,
+            "has_head": has_head,
+            "at": utc_now(),
+        }
+    )
+
+
+def command_slash(args: argparse.Namespace) -> CommandResult:
+    action = args.action
+    if action not in {"retry-ai", "retry-human"} and args.task_id is not None:
+        raise LoopSailError(f"slash action {action} does not accept arguments")
+    if action == "doctor":
+        return command_doctor(argparse.Namespace(runner_config=None))
+    if action == "init-check":
+        return command_init_check(args)
+    if action in {"init", "init-confirmed"}:
+        return command_init(
+            argparse.Namespace(yes=action == "init-confirmed", runner_config=None)
+        )
+    if action == "validate":
+        return command_validate(slash_args())
+    if action == "status":
+        return command_status(slash_args())
+    if action == "prepare-step":
+        return prepare_step(slash_args())
+    if action == "finalize-step":
+        return finalize_step(slash_args())
+    if action in {"retry-ai", "retry-human"}:
+        actor = "ai" if action == "retry-ai" else "human"
+        return command_retry(
+            slash_args(actor=actor, requested_task_id=args.task_id)
+        )
+    raise LoopSailError(f"unknown slash action: {action}")
+
+
+class EnvelopeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise LoopSailError(message, code="invalid_arguments")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = EnvelopeArgumentParser(description=__doc__)
     parser.add_argument(
         "--runner-config", type=Path, help="highest-priority loopsail configuration file"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    init = subparsers.add_parser("init", help="在当前仓库生成通用 loopsail 项目骨架")
-    init.add_argument(
-        "--yes",
-        action="store_true",
-        help="自动同意创建 Git 仓库和初始提交的确认",
-    )
+    init = subparsers.add_parser("init", help="initialize a LoopSail project")
+    init.add_argument("--yes", action="store_true")
     init.set_defaults(handler=command_init)
-    doctor = subparsers.add_parser("doctor", help="validate the configured Claude launcher")
+    doctor = subparsers.add_parser("doctor", help="validate the plugin runtime")
     doctor.set_defaults(handler=command_doctor)
-    for name, help_text, handler in (
-        ("validate", "validate configuration and a task list", command_validate),
-        (
-            "run",
-            "execute or resume a task list; use --once for one JSON-reported step",
-            command_run,
-        ),
-        ("status", "show task-list runtime status", command_status),
+    for name, handler in (
+        ("validate", command_validate),
+        ("status", command_status),
+        ("prepare-step", prepare_step),
+        ("finalize-step", finalize_step),
     ):
-        command = subparsers.add_parser(name, help=help_text)
+        command = subparsers.add_parser(name)
         command.add_argument("task_list", type=Path)
-        if name == "run":
-            command.add_argument(
-                "--once",
-                action="store_true",
-                help="execute one progress unit and emit a JSON step report",
-            )
         command.set_defaults(handler=handler)
-    retry = subparsers.add_parser(
-        "retry", help="retry a blocked task with --actor human or ai"
-    )
+    retry = subparsers.add_parser("retry")
     retry.add_argument("task_list", type=Path)
     retry.add_argument("task_id")
     retry.add_argument("--reason", required=True)
     retry.add_argument("--actor", choices=("human", "ai"), default="human")
     retry.set_defaults(handler=command_retry)
-    slash = subparsers.add_parser(
-        "slash",
-        help="internal fixed-argument adapter for Claude Code slash commands",
-    )
+    slash = subparsers.add_parser("slash")
     slash.add_argument(
         "action",
         choices=(
@@ -2615,8 +2512,8 @@ def build_parser() -> argparse.ArgumentParser:
             "init",
             "init-confirmed",
             "validate",
-            "run-once",
-            "run-all",
+            "prepare-step",
+            "finalize-step",
             "status",
             "retry-ai",
             "retry-human",
@@ -2628,13 +2525,46 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
     try:
-        return int(args.handler(args))
+        parser = build_parser()
+        args = parser.parse_args(argv)
+        data, exit_code, error = args.handler(args)
+        envelope = command_envelope(
+            ok=error is None,
+            exit_code=exit_code,
+            data=data,
+            error=error,
+        )
+    except ProtocolError as exc:
+        exit_code = 2
+        envelope = command_envelope(
+            ok=False,
+            exit_code=exit_code,
+            data=None,
+            error={"code": exc.code, "message": str(exc), "details": None},
+        )
     except LoopSailError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+        exit_code = 2
+        envelope = command_envelope(
+            ok=False,
+            exit_code=exit_code,
+            data=None,
+            error={"code": exc.code, "message": str(exc), "details": None},
+        )
+    except Exception as exc:
+        exit_code = 2
+        envelope = command_envelope(
+            ok=False,
+            exit_code=exit_code,
+            data=None,
+            error={
+                "code": "internal_error",
+                "message": f"{type(exc).__name__}: {exc}",
+                "details": None,
+            },
+        )
+    print(json.dumps(envelope, ensure_ascii=False, separators=(",", ":")))
+    return exit_code
 
 
 if __name__ == "__main__":

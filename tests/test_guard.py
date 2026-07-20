@@ -1,23 +1,17 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 
-SKILL_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / "plugins"
-    / "loopsail"
-    / "skills"
-    / "loopsail"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_ROOT = PROJECT_ROOT / "plugins/loopsail/skills/loopsail/scripts"
+SPEC = importlib.util.spec_from_file_location(
+    "loopsail_guard_v2_test", SCRIPT_ROOT / "guard.py"
 )
-GUARD_PATH = SKILL_ROOT / "scripts" / "guard.py"
-SPEC = importlib.util.spec_from_file_location("loopsail_guard_under_test", GUARD_PATH)
 assert SPEC and SPEC.loader
 guard = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = guard
@@ -29,72 +23,81 @@ class GuardTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.environment = mock.patch.dict(
-            os.environ,
-            {
-                "LOOPSAIL_PROJECT_ROOT": str(self.root),
-                "LOOPSAIL_TOOL_DIR": str(self.root.parent / "loopsail-installation"),
-                "LOOPSAIL_TASK_FILE": str(self.root / "TASKS.json"),
-                "LOOPSAIL_ALLOWED_PATHS": '["src/**", "tests/**"]',
-                "LOOPSAIL_PROTECTED_PATHS": '["src/generated/**"]',
-            },
-            clear=False,
-        )
-        self.environment.start()
-        self.addCleanup(self.environment.stop)
+        self.tool_root = self.root.parent / "plugin-install"
+        self.context = {
+            "root": self.root,
+            "tool_root": self.tool_root,
+            "request_path": ".loopsail/input/list/request.json",
+            "task_file": "TASKS.json",
+            "allowed_paths": ["src/**", "tests/**"],
+            "protected_paths": ["src/generated/**"],
+        }
 
-    def test_blocks_worker_git_mutations(self) -> None:
-        self.assertIn("coordinator", guard.decide("Bash", {"command": "git commit -m done"}))
-        self.assertIn("coordinator", guard.decide("Bash", {"command": "git push origin main"}))
+    def decide(self, tool: str, value: dict[str, object]) -> str | None:
+        return guard.decide(tool, value, self.context)
+
+    def test_allows_exact_request_read_and_in_scope_work(self) -> None:
+        self.assertIsNone(
+            self.decide(
+                "Read",
+                {"file_path": str(self.root / ".loopsail/input/list/request.json")},
+            )
+        )
+        self.assertIsNone(
+            self.decide("Edit", {"file_path": str(self.root / "src/app.py")})
+        )
+        self.assertIsNone(self.decide("Bash", {"command": "git diff --check"}))
+
+    def test_denies_other_control_files_and_mutations(self) -> None:
+        reason = self.decide(
+            "Read", {"file_path": str(self.root / ".loopsail/runs/list/state.json")}
+        )
+        self.assertIn("bound immutable", reason)
         self.assertIn(
-            "control files",
-            guard.decide("Bash", {"command": "python3 inspect.py .loopsail/runs/test/state.json"}),
+            "protected",
+            self.decide("Edit", {"file_path": str(self.root / "TASKS.json")}),
+        )
+        self.assertIn(
+            "outside",
+            self.decide("Write", {"file_path": str(self.root / "docs/extra.md")}),
+        )
+        self.assertIn(
+            "protected",
+            self.decide(
+                "Write", {"file_path": str(self.root / "src/generated/client.py")}
+            ),
         )
 
-    def test_allows_read_only_git_and_in_scope_edit(self) -> None:
-        self.assertIsNone(guard.decide("Bash", {"command": "git diff --check"}))
-        self.assertIsNone(guard.decide("Edit", {"file_path": str(self.root / "src" / "app.py")}))
+    def test_denies_git_external_secret_destructive_and_unknown_tools(self) -> None:
+        cases = [
+            ("Bash", {"command": "git commit -m done"}, "Git mutations"),
+            ("Bash", {"command": "git -C . -c user.name=x commit -m done"}, "Git mutations"),
+            ("Bash", {"command": "curl -X POST https://example.invalid"}, "external"),
+            ("Bash", {"command": "rm -rf build"}, "deletion"),
+            ("Read", {"file_path": str(self.root / ".env")}, "secret"),
+            ("Agent", {"prompt": "delegate"}, "not allowed"),
+        ]
+        for tool, value, expected in cases:
+            with self.subTest(tool=tool, value=value):
+                self.assertIn(expected.lower(), self.decide(tool, value).lower())
 
-    def test_blocks_protected_and_out_of_scope_paths(self) -> None:
-        protected = guard.decide("Edit", {"file_path": str(self.root / "LOOP.md")})
-        self.assertIn("protected", protected)
-        task_input = guard.decide("Edit", {"file_path": str(self.root / "TASKS.json")})
-        self.assertIn("protected", task_input)
-        experience = guard.decide(
-            "Edit", {"file_path": str(self.root / guard.LESSONS_FILE)}
+    def test_missing_policy_fails_closed(self) -> None:
+        self.assertIn(
+            "invalid",
+            guard.decide("Read", {"file_path": "src/a.py"}, {"root": self.root}),
         )
-        self.assertIn("protected", experience)
-        skill = guard.decide(
-            "Edit",
-            {
-                "file_path": str(
-                    self.root / ".claude" / "skills" / "loopsail" / "SKILL.md"
-                )
-            },
-        )
-        self.assertIn("protected", skill)
-        shell_experience = guard.decide(
-            "Bash", {"command": f"echo note >> {guard.LESSONS_FILE}"}
-        )
-        self.assertIn("coordinator", shell_experience)
-        outside = guard.decide("Write", {"file_path": str(self.root / "docs" / "extra.md")})
-        self.assertIn("outside", outside)
-        configured = guard.decide(
-            "Edit", {"file_path": str(self.root / "src" / "generated" / "client.py")}
-        )
-        self.assertIn("protected", configured)
-        installation = guard.decide(
-            "Write", {"file_path": str(self.root.parent / "loopsail-installation" / "loopsail.py")}
-        )
-        self.assertIn("installation", installation)
-        shell_installation = guard.decide(
-            "Bash", {"command": "sed -i s/old/new/ ../loopsail-installation/loopsail.py"}
-        )
-        self.assertIn("installation", shell_installation)
 
-    def test_blocks_secret_paths_and_destructive_commands(self) -> None:
-        self.assertIn("secret", guard.decide("Read", {"file_path": str(self.root / ".env")}))
-        self.assertIn("deletion", guard.decide("Bash", {"command": "rm -rf build"}))
+    def test_edit_content_is_not_misclassified_as_a_path(self) -> None:
+        self.assertIsNone(
+            self.decide(
+                "Edit",
+                {
+                    "file_path": str(self.root / "src/app.py"),
+                    "old_string": "route = '/api/v1'",
+                    "new_string": "route = '/api/v2'",
+                },
+            )
+        )
 
 
 if __name__ == "__main__":

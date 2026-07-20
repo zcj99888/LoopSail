@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LoopSail Worker Request v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "attempt",
+    "branch",
+    "created_at",
+    "kind",
+    "list_id",
+    "policy",
+    "previous_failure",
+    "project",
+    "request_id",
+    "schema_version",
+    "task",
+    "task_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "kind": {
+      "const": "worker-request"
+    },
+    "request_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "list_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,63}$"
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "task": {
+      "type": "object"
+    },
+    "previous_failure": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "allowed_paths",
+        "protected_paths",
+        "request_path"
+      ],
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "protected_paths": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "request_path": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

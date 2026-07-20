@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LoopSail Status Report v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "started",
+    "list_id",
+    "project_status",
+    "branch",
+    "active_task",
+    "active_request",
+    "final_verification",
+    "tasks",
+    "at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "kind": {
+      "const": "status-report"
+    },
+    "started": {
+      "type": "boolean"
+    },
+    "list_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "project_status": {
+      "enum": [
+        "not_started",
+        "executing",
+        "blocked",
+        "complete"
+      ]
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "active_task": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "active_request": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "final_verification": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}

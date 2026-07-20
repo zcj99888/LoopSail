@@ -1,51 +1,50 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "LoopSail Step Report v2",
+  "title": "LoopSail Run State v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema_version",
     "kind",
-    "action",
-    "performed",
     "list_id",
+    "project",
+    "task_file",
     "branch",
+    "base_commit",
     "project_status",
-    "request_id",
-    "request_path",
-    "worker_agent",
-    "task",
-    "blocked_reason",
-    "tasks_remaining",
-    "next_action",
-    "at"
+    "active_task",
+    "active_request",
+    "last_finalized_request",
+    "final_verification",
+    "final_verification_attempts",
+    "tasks",
+    "created_at",
+    "updated_at"
   ],
   "properties": {
     "schema_version": {
       "const": 2
     },
     "kind": {
-      "const": "step-report"
-    },
-    "action": {
-      "enum": [
-        "spawn_worker",
-        "finalize_pending",
-        "finalized",
-        "blocked",
-        "idle",
-        "complete",
-        "already_complete"
-      ]
-    },
-    "performed": {
-      "type": "boolean"
+      "const": "run-state"
     },
     "list_id": {
       "type": "string",
       "minLength": 1
     },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "task_file": {
+      "type": "string",
+      "minLength": 1
+    },
     "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_commit": {
       "type": "string",
       "minLength": 1
     },
@@ -56,47 +55,42 @@
         "complete"
       ]
     },
-    "request_id": {
+    "active_task": {
       "type": [
         "string",
         "null"
       ]
     },
-    "request_path": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "worker_agent": {
-      "type": [
-        "string",
-        "null"
-      ]
-    },
-    "task": {
+    "active_request": {
       "type": [
         "object",
         "null"
       ]
     },
-    "blocked_reason": {
+    "last_finalized_request": {
       "type": [
-        "string",
+        "object",
         "null"
       ]
     },
-    "tasks_remaining": {
+    "final_verification": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "final_verification_attempts": {
       "type": "integer",
       "minimum": 0
     },
-    "next_action": {
-      "type": [
-        "string",
-        "null"
-      ]
+    "tasks": {
+      "type": "object"
     },
-    "at": {
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
       "type": "string",
       "format": "date-time"
     }

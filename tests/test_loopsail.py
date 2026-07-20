@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import hashlib
 import importlib.util
 import io
 import json
@@ -16,15 +15,24 @@ from unittest import mock
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-PLUGIN_ROOT = PROJECT_ROOT / "plugins" / "loopsail"
-SKILL_ROOT = PLUGIN_ROOT / "skills" / "loopsail"
-SPEC = importlib.util.spec_from_file_location(
-    "loopsail_under_test", SKILL_ROOT / "scripts" / "loopsail.py"
-)
-assert SPEC and SPEC.loader
-loopsail = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = loopsail
-SPEC.loader.exec_module(loopsail)
+SKILL_ROOT = PROJECT_ROOT / "plugins" / "loopsail" / "skills" / "loopsail"
+SCRIPT_ROOT = SKILL_ROOT / "scripts"
+if str(SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_ROOT))
+
+
+def load_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+protocol = load_module("loopsail_protocol_test", SCRIPT_ROOT / "protocol.py")
+loopsail = load_module("loopsail_runtime_test", SCRIPT_ROOT / "loopsail.py")
+hook = load_module("loopsail_hook_test", SCRIPT_ROOT / "hook.py")
 
 
 def write_json(path: Path, value: dict[str, object]) -> None:
@@ -36,52 +44,56 @@ def command(*argv: str) -> dict[str, object]:
     return {"argv": list(argv), "cwd": ".", "timeout_seconds": 30}
 
 
-def task(task_id: str, *, dependencies: list[str] | None = None) -> dict[str, object]:
-    return {
+def task(task_id: str = "T-001", **overrides: object) -> dict[str, object]:
+    value: dict[str, object] = {
         "id": task_id,
-        "title": task_id,
+        "title": f"Task {task_id}",
         "description": f"Implement {task_id}",
-        "depends_on": dependencies or [],
+        "depends_on": [],
         "context_files": ["CLAUDE.md"],
         "allowed_paths": ["result*.txt"],
-        "acceptance": [f"{task_id} is implemented"],
-        "verify_commands": [command("python3", "-c", "raise SystemExit(0)")],
-    }
-
-
-def task_list(*tasks: dict[str, object], list_id: str = "test-run") -> dict[str, object]:
-    return {
-        "schema_version": 1,
-        "list_id": list_id,
-        "project": "Test",
-        "final_verify_commands": [command("python3", "-c", "raise SystemExit(0)")],
-        "tasks": list(tasks),
-    }
-
-
-def lesson(**overrides: object) -> dict[str, object]:
-    value: dict[str, object] = {
-        "challenge": "定位一个非显而易见的问题",
-        "detour": "先检查了无关模块",
-        "root_cause": "边界条件没有被现有测试覆盖",
-        "resolution": "补充实现和回归测试",
-        "takeaway": "先从失败断言反推最小复现",
+        "acceptance": ["result.txt contains ok"],
+        "verify_commands": [
+            command(
+                "python3",
+                "-c",
+                "from pathlib import Path; raise SystemExit(Path('result.txt').read_text().strip() != 'ok')",
+            )
+        ],
     }
     value.update(overrides)
     return value
 
 
-def git_at(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(root), *args],
-        check=check,
-        text=True,
-        capture_output=True,
-    )
+def task_list(
+    *tasks: dict[str, object],
+    list_id: str = "test-list",
+    final_passes: bool = True,
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "kind": "task-list",
+        "list_id": list_id,
+        "project": "Test Project",
+        "final_verify_commands": [
+            command("python3", "-c", f"raise SystemExit({0 if final_passes else 1})")
+        ],
+        "tasks": list(tasks or (task(),)),
+    }
+
+
+def lesson() -> dict[str, object]:
+    return {
+        "challenge": "A subtle boundary",
+        "detour": None,
+        "root_cause": "Missing protocol binding",
+        "resolution": "Bound the result to the request",
+        "takeaway": "Validate identity and content independently",
+    }
 
 
 @contextlib.contextmanager
-def working_directory(path: Path):
+def cwd(path: Path):
     previous = Path.cwd()
     os.chdir(path)
     try:
@@ -90,1643 +102,684 @@ def working_directory(path: Path):
         os.chdir(previous)
 
 
-class TemporaryGitProject:
+class GitProject:
     def __init__(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.home = self.root / "home"
+        self.home.mkdir()
         self.git("init", "-b", "main")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.invalid")
         (self.root / ".gitignore").write_text(
-            "/TASKS.json\n.loopsail/runs/\n.loopsail/logs/\n.loopsail/lock\n",
+            "/TASKS.json\n.loopsail/input/\n.loopsail/output/\n"
+            ".loopsail/runs/\n.loopsail/logs/\n.loopsail/lock\n",
             encoding="utf-8",
         )
         (self.root / "CLAUDE.md").write_text("# Test project\n", encoding="utf-8")
-        (self.root / loopsail.LESSONS_FILE).write_text("# Test experience log\n", encoding="utf-8")
+        (self.root / loopsail.LESSONS_FILE).write_text(
+            "# Test experience\n", encoding="utf-8"
+        )
         self.git("add", ".")
-        self.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "initial")
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "test@example.invalid")
+        self.git("commit", "-m", "initial")
+        self.write_tasks(task_list())
 
-    def git(self, *args: str) -> subprocess.CompletedProcess[str]:
+    def git(self, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", "-C", str(self.root), *args],
-            check=True,
+            check=check,
             text=True,
             capture_output=True,
         )
+
+    def write_tasks(self, value: dict[str, object]) -> None:
+        write_json(self.root / "TASKS.json", value)
+
+    def call(self, *arguments: str) -> tuple[int, dict[str, object], str]:
+        output = io.StringIO()
+        errors = io.StringIO()
+        with cwd(self.root), mock.patch.dict(
+            os.environ, {"HOME": str(self.home)}, clear=False
+        ), contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = loopsail.main(list(arguments))
+        lines = output.getvalue().splitlines()
+        if len(lines) != 1:
+            raise AssertionError(f"expected one stdout line, got {lines!r}")
+        envelope = json.loads(lines[0])
+        return code, envelope, errors.getvalue()
+
+    def state(self, list_id: str = "test-list") -> dict[str, object]:
+        return json.loads(
+            (
+                self.root / ".loopsail" / "runs" / list_id / "state.json"
+            ).read_text(encoding="utf-8")
+        )
+
+    def request(self) -> dict[str, object]:
+        lease = self.state()["active_request"]
+        assert isinstance(lease, dict)
+        return json.loads((self.root / lease["request_path"]).read_text(encoding="utf-8"))
+
+    def start_agent(self, agent_id: str = "agent-1") -> None:
+        payload = {
+            "hook_event_name": "SubagentStart",
+            "agent_type": "loopsail:worker",
+            "agent_id": agent_id,
+            "session_id": "session-1",
+            "cwd": str(self.root),
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assert_hook_ok(hook.subagent_start(payload))
+
+    @staticmethod
+    def assert_hook_ok(value: int) -> None:
+        if value != 0:
+            raise AssertionError(f"hook returned {value}")
+
+    def worker_result(
+        self,
+        *,
+        status: str = "completed",
+        blocker: str | None = None,
+        changed_files: list[str] | None = None,
+    ) -> dict[str, object]:
+        request = self.request()
+        return {
+            "schema_version": 2,
+            "kind": "worker-result",
+            "request_id": request["request_id"],
+            "list_id": request["list_id"],
+            "task_id": request["task_id"],
+            "attempt": request["attempt"],
+            "status": status,
+            "summary": "implemented" if status == "completed" else "blocked",
+            "changed_files": changed_files or [],
+            "verification_results": [],
+            "lessons": [lesson()],
+            "blocker": blocker,
+        }
+
+    def stop_agent(
+        self,
+        value: dict[str, object] | str,
+        *,
+        agent_id: str = "agent-1",
+        stop_hook_active: bool = False,
+    ) -> str:
+        message = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        payload = {
+            "hook_event_name": "SubagentStop",
+            "agent_type": "loopsail:worker",
+            "agent_id": agent_id,
+            "session_id": "session-1",
+            "cwd": str(self.root),
+            "last_assistant_message": message,
+            "stop_hook_active": stop_hook_active,
+        }
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assert_hook_ok(hook.subagent_stop(payload))
+        return output.getvalue()
 
     def close(self) -> None:
         self.temporary.cleanup()
 
 
-class InitTests(unittest.TestCase):
+class ProjectTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
-
-    def make_repository(self, name: str, *, commit: bool) -> Path:
-        root = self.base / name
-        root.mkdir()
-        git_at(root, "init", "-b", "main")
-        git_at(root, "config", "user.name", "Test")
-        git_at(root, "config", "user.email", "test@example.invalid")
-        if commit:
-            (root / "README.md").write_text("# Seed\n", encoding="utf-8")
-            git_at(root, "add", "README.md")
-            git_at(root, "commit", "-m", "seed")
-        return root
-
-    def call_init(self, root: Path, *, yes: bool = False) -> str:
-        output = io.StringIO()
-        with working_directory(root), contextlib.redirect_stdout(output):
-            exit_code = loopsail.command_init(argparse.Namespace(yes=yes))
-        self.assertEqual(exit_code, 0)
-        return output.getvalue()
-
-    def test_complete_scaffold_uses_repository_root_and_project_name(self) -> None:
-        root = self.make_repository("示例项目", commit=True)
-        nested = root / "nested"
-        nested.mkdir()
-
-        output = self.call_init(nested, yes=True)
-
-        self.assertIn(str(root), output)
-        self.assertIn("created:", output)
-        self.assertIn("项目开发规范", (root / "CLAUDE.md").read_text(encoding="utf-8"))
-        self.assertIn("完整阅读 `CLAUDE.md`", (root / "AGENTS.md").read_text(encoding="utf-8"))
-        self.assertIn("由人审阅", (root / "LOOP.md").read_text(encoding="utf-8"))
-        self.assertIn(
-            "示例项目 经验记录", (root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        )
-        self.assertFalse((root / ".claude" / "skills" / "loopsail").exists())
-        template = json.loads((root / "TASKS.template.json").read_text(encoding="utf-8"))
-        self.assertEqual(template["project"], "示例项目")
-        with self.assertRaises(loopsail.LoopSailError):
-            loopsail.validate_task_list(template, root)
-        task_file = json.loads((root / "TASKS.json").read_text(encoding="utf-8"))
-        self.assertEqual(task_file, template)
-        self.assertFalse((root / ".loopsail" / "input").exists())
-        self.assertEqual(
-            git_at(root, "check-ignore", "-q", "TASKS.json", check=False).returncode,
-            0,
-        )
-        self.assertFalse((root / ".loopsail" / "config.json").exists())
-        self.assertFalse((root / ".loopsail" / "runs").exists())
-        self.assertFalse((nested / "CLAUDE.md").exists())
-        self.assertEqual(git_at(root, "rev-list", "--count", "HEAD").stdout.strip(), "1")
-
-    def test_existing_files_are_preserved_and_gitignore_merge_is_idempotent(self) -> None:
-        root = self.make_repository("project", commit=False)
-        original_claude = "# Existing rules\n"
-        original_lessons = "# Existing experience\n\nKeep this note.\n"
-        (root / "CLAUDE.md").write_text(original_claude, encoding="utf-8")
-        (root / loopsail.LESSONS_FILE).write_text(original_lessons, encoding="utf-8")
-        (root / ".gitignore").write_text("custom/\n.loopsail/input/", encoding="utf-8")
-        (root / "README.md").write_text("# Seed\n", encoding="utf-8")
-        git_at(root, "add", ".")
-        git_at(root, "commit", "-m", "seed")
-
-        first_output = self.call_init(root)
-        generated_agents = (root / "AGENTS.md").read_bytes()
-        first_gitignore = (root / ".gitignore").read_text(encoding="utf-8")
-        working_task = root / "TASKS.json"
-        working_task.write_text('{"preserved": true}\n', encoding="utf-8")
-        second_output = self.call_init(root)
-
-        self.assertIn("updated:\n  - .gitignore", first_output)
-        self.assertEqual((root / "CLAUDE.md").read_text(encoding="utf-8"), original_claude)
-        self.assertEqual(
-            (root / loopsail.LESSONS_FILE).read_text(encoding="utf-8"), original_lessons
-        )
-        self.assertEqual((root / "AGENTS.md").read_bytes(), generated_agents)
-        self.assertFalse((root / ".claude" / "skills" / "loopsail").exists())
-        self.assertEqual((root / ".gitignore").read_text(encoding="utf-8"), first_gitignore)
-        for entry in loopsail.INIT_GITIGNORE_ENTRIES:
-            self.assertEqual(first_gitignore.splitlines().count(entry), 1)
-        self.assertEqual(working_task.read_text(encoding="utf-8"), '{"preserved": true}\n')
-        self.assertIn("created:\n  - (none)", second_output)
-        self.assertIn("  - TASKS.json", second_output)
-
-    def test_existing_project_template_seeds_root_working_task_file(self) -> None:
-        root = self.make_repository("custom-template", commit=True)
-        custom_template = '{"schema_version": 1, "project": "custom"}\n'
-        (root / "TASKS.template.json").write_text(custom_template, encoding="utf-8")
-
-        self.call_init(root)
-
-        self.assertEqual((root / "TASKS.json").read_text(encoding="utf-8"), custom_template)
-
-    def test_non_repository_requires_confirmation_before_writing(self) -> None:
-        noninteractive = self.base / "noninteractive"
-        noninteractive.mkdir()
-        with working_directory(noninteractive), mock.patch.object(
-            loopsail, "stdin_is_interactive", return_value=False
-        ):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "不是 Git 仓库"):
-                loopsail.command_init(argparse.Namespace(yes=False))
-        self.assertFalse((noninteractive / ".git").exists())
-        self.assertEqual(list(noninteractive.iterdir()), [])
-
-        interactive = self.base / "interactive"
-        interactive.mkdir()
-        with working_directory(interactive), mock.patch.object(
-            loopsail, "stdin_is_interactive", return_value=True
-        ), mock.patch("builtins.input", return_value="n"):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "已取消"):
-                loopsail.command_init(argparse.Namespace(yes=False))
-        self.assertFalse((interactive / ".git").exists())
-
-    def test_interactive_git_init_can_decline_initial_commit(self) -> None:
-        root = self.base / "prompted"
-        root.mkdir()
-        output = io.StringIO()
-        with working_directory(root), contextlib.redirect_stdout(output), mock.patch.object(
-            loopsail, "stdin_is_interactive", return_value=True
-        ), mock.patch("builtins.input", side_effect=["yes", "no"]):
-            self.assertEqual(loopsail.command_init(argparse.Namespace(yes=False)), 0)
-
-        self.assertTrue((root / ".git").is_dir())
-        self.assertNotEqual(
-            git_at(root, "rev-parse", "--verify", "HEAD", check=False).returncode,
-            0,
-        )
-        self.assertIn("git: initialized", output.getvalue())
-        self.assertIn("commit: skipped", output.getvalue())
-
-    def test_yes_initializes_git_and_creates_only_scaffold_commit(self) -> None:
-        root = self.base / "automated"
-        root.mkdir()
-        identity = {
-            "GIT_AUTHOR_NAME": "Test",
-            "GIT_AUTHOR_EMAIL": "test@example.invalid",
-            "GIT_COMMITTER_NAME": "Test",
-            "GIT_COMMITTER_EMAIL": "test@example.invalid",
-        }
-        with mock.patch.dict(os.environ, identity), working_directory(root):
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                self.assertEqual(loopsail.command_init(argparse.Namespace(yes=True)), 0)
-
-        self.assertEqual(
-            git_at(root, "show", "-s", "--format=%s", "HEAD").stdout.strip(),
-            loopsail.INIT_COMMIT_MESSAGE,
-        )
-        committed = set(
-            git_at(
-                root, "-c", "core.quotePath=false", "ls-tree", "-r", "--name-only", "HEAD"
-            ).stdout.splitlines()
-        )
-        expected_scaffold = {
-            ".gitignore",
-            "AGENTS.md",
-            "CLAUDE.md",
-            "LOOP.md",
-            "TASKS.template.json",
-            loopsail.LESSONS_FILE,
-        }
-        expected_scaffold.update(target for _, target in loopsail.INIT_TEMPLATE_FILES)
-        self.assertEqual(committed, expected_scaffold)
-        self.assertIn("commit:", output.getvalue())
-
-    def test_initial_commit_preserves_unrelated_staged_content(self) -> None:
-        root = self.make_repository("staged", commit=False)
-        (root / "unrelated.txt").write_text("user content\n", encoding="utf-8")
-        git_at(root, "add", "unrelated.txt")
-
-        self.call_init(root, yes=True)
-
-        committed = git_at(root, "ls-tree", "-r", "--name-only", "HEAD").stdout.splitlines()
-        self.assertNotIn("unrelated.txt", committed)
-        self.assertIn("A  unrelated.txt", git_at(root, "status", "--short").stdout)
-
-    def test_missing_identity_does_not_stage_scaffold(self) -> None:
-        root = self.make_repository("no-identity", commit=False)
-        result = loopsail.initialize_scaffold(root)
-        completed = subprocess.CompletedProcess(["git", "var"], 1, "", "missing identity")
-        with mock.patch.object(loopsail, "run_git", return_value=completed):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "身份未配置"):
-                loopsail.create_initial_commit(root, result["touched"])
-        status = git_at(root, "status", "--short").stdout
-        self.assertNotIn("A  CLAUDE.md", status)
-        self.assertIn("?? CLAUDE.md", status)
-
-    def test_commit_hook_failure_keeps_scaffold_staged(self) -> None:
-        root = self.make_repository("hook-failure", commit=False)
-        result = loopsail.initialize_scaffold(root)
-        hook = root / ".git" / "hooks" / "pre-commit"
-        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
-        hook.chmod(0o755)
-
-        with self.assertRaisesRegex(loopsail.LoopSailError, "可能仍处于暂存状态"):
-            loopsail.create_initial_commit(root, result["touched"])
-        self.assertIn("A  CLAUDE.md", git_at(root, "status", "--short").stdout)
-
-    def test_unsafe_target_fails_preflight_and_write_failure_rolls_back(self) -> None:
-        unsafe = self.make_repository("unsafe", commit=True)
-        (unsafe / "CLAUDE.md").mkdir()
-        with working_directory(unsafe):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "not a regular file"):
-                loopsail.command_init(argparse.Namespace(yes=False))
-        self.assertFalse((unsafe / ".loopsail").exists())
-        self.assertFalse((unsafe / ".gitignore").exists())
-
-        rollback = self.make_repository("rollback", commit=True)
-        original_write = loopsail.atomic_write_bytes
-
-        skill_path = rollback / "LOOP.md"
-
-        def failing_write(path: Path, value: bytes, *, replace_existing: bool) -> None:
-            if path == skill_path:
-                raise OSError("simulated write failure")
-            original_write(path, value, replace_existing=replace_existing)
-
-        with mock.patch.object(loopsail, "atomic_write_bytes", side_effect=failing_write):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "was rolled back"):
-                loopsail.initialize_scaffold(rollback)
-        self.assertFalse((rollback / "CLAUDE.md").exists())
-        self.assertFalse((rollback / ".loopsail").exists())
-        self.assertFalse((rollback / ".claude").exists())
-        self.assertFalse((rollback / ".gitignore").exists())
-
-
-class SlashAdapterTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name) / "project"
-        self.root.mkdir()
-        git_at(self.root, "init", "-b", "main")
-
-    def test_slash_task_file_is_always_project_root_file(self) -> None:
-        nested = self.root / "nested"
-        nested.mkdir()
-        with working_directory(nested):
-            args = loopsail.slash_task_args()
-        self.assertEqual(args.task_list, self.root / "TASKS.json")
-
-    def test_slash_retry_requires_the_active_task_id_shape(self) -> None:
-        state_path = self.root / "state.json"
-        state_path.write_text("{}\n", encoding="utf-8")
-        task_value = {"list_id": "test-run"}
-        state = {
-            "project_status": "blocked",
-            "active_task": "TASK-001",
-            "tasks": {
-                "TASK-001": {"last_failure": {"summary": "temporary launcher failure"}}
-            },
-        }
-
-        patches = (
-            mock.patch.object(
-                loopsail,
-                "load_task_input",
-                return_value=(self.root / "TASKS.json", task_value),
-            ),
-            mock.patch.object(
-                loopsail,
-                "state_paths",
-                return_value=(state_path, self.root / "snapshot.json", self.root / "logs"),
-            ),
-            mock.patch.object(loopsail, "load_json", return_value=state),
-            mock.patch.object(loopsail, "validate_state"),
-        )
-        with working_directory(self.root), patches[0], patches[1], patches[2], patches[3]:
-            with self.assertRaisesRegex(loopsail.LoopSailError, "valid task ID"):
-                loopsail.slash_task_args(actor="ai", requested_task_id="; git status")
-            with self.assertRaisesRegex(loopsail.LoopSailError, "active blocked task"):
-                loopsail.slash_task_args(actor="ai", requested_task_id="TASK-002")
-            args = loopsail.slash_task_args(actor="ai", requested_task_id="TASK-001")
-
-        self.assertEqual(args.task_list, self.root / "TASKS.json")
-        self.assertEqual(args.task_id, "TASK-001")
-        self.assertEqual(args.actor, "ai")
-        self.assertIn("temporary launcher failure", args.reason)
-
-    def test_non_retry_slash_actions_reject_extra_arguments(self) -> None:
-        with self.assertRaisesRegex(loopsail.LoopSailError, "does not accept arguments"):
-            loopsail.command_slash(
-                argparse.Namespace(action="doctor", task_id="unexpected")
-            )
-
-
-class ConfigTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        base = Path(self.temporary.name)
-        self.home = base / "home"
-        self.root = base / "project"
-        self.root.mkdir()
-
-    def test_user_project_and_explicit_config_overlay_by_field(self) -> None:
-        write_json(
-            self.home / ".loopsail" / "config.json",
-            {"claude": {"command_prefix": ["user-claude"]}, "worker_timeout_seconds": 100},
-        )
-        write_json(
-            self.root / ".loopsail" / "config.json",
-            {"claude": {"extra_args": ["--effort", "high"]}, "worker_timeout_seconds": 200},
-        )
-        explicit = self.root / "explicit.json"
-        write_json(explicit, {"log_output_limit_bytes": 1234})
-        with mock.patch.object(loopsail.Path, "home", return_value=self.home):
-            config, sources = loopsail.load_config(self.root, explicit)
-        self.assertEqual(config["claude"]["command_prefix"], ["user-claude"])
-        self.assertEqual(config["claude"]["extra_args"], ["--effort", "high"])
-        self.assertEqual(config["worker_timeout_seconds"], 200)
-        self.assertEqual(config["log_output_limit_bytes"], 1234)
-        self.assertEqual(len(sources), 4)
-
-    def test_arrays_replace_and_unknown_keys_fail(self) -> None:
-        with self.assertRaisesRegex(loopsail.LoopSailError, "unknown keys"):
-            loopsail.validate_config({"unknown": True})
-        with self.assertRaisesRegex(loopsail.LoopSailError, "inline secret"):
-            loopsail.validate_config({"claude": {"extra_args": ["TOKEN=secret-value"]}})
-
-
-class TaskListValidationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        (self.root / "CLAUDE.md").write_text("# Test\n", encoding="utf-8")
-
-    def test_valid_list_is_normalized(self) -> None:
-        value = task_list(task("TASK-001"), task("TASK-002", dependencies=["TASK-001"]))
-        normalized = loopsail.validate_task_list(value, self.root)
-        self.assertEqual([item["id"] for item in normalized["tasks"]], ["TASK-001", "TASK-002"])
-
-    def test_unknown_dependency_and_cycle_fail(self) -> None:
-        with self.assertRaisesRegex(loopsail.LoopSailError, "unknown dependency"):
-            loopsail.validate_task_list(task_list(task("TASK-001", dependencies=["NOPE"])), self.root)
-        first = task("TASK-001", dependencies=["TASK-002"])
-        second = task("TASK-002", dependencies=["TASK-001"])
-        with self.assertRaisesRegex(loopsail.LoopSailError, "dependency cycle"):
-            loopsail.validate_task_list(task_list(first, second), self.root)
-
-    def test_duplicate_id_escaping_context_and_shell_command_fail(self) -> None:
-        with self.assertRaisesRegex(loopsail.LoopSailError, "duplicate task id"):
-            loopsail.validate_task_list(task_list(task("TASK-001"), task("TASK-001")), self.root)
-        bad = task("TASK-001")
-        bad["context_files"] = ["../secret"]
-        with self.assertRaisesRegex(loopsail.LoopSailError, "stay within"):
-            loopsail.validate_task_list(task_list(bad), self.root)
-        bad_command = task("TASK-001")
-        bad_command["verify_commands"] = [command("git", "push")]
-        with self.assertRaisesRegex(loopsail.LoopSailError, "may not mutate Git"):
-            loopsail.validate_task_list(task_list(bad_command), self.root)
-
-
-class SelectionAndStateTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.project = TemporaryGitProject()
+        self.project = GitProject()
         self.addCleanup(self.project.close)
-        self.normalized = loopsail.validate_task_list(
-            task_list(task("TASK-001"), task("TASK-002", dependencies=["TASK-001"])),
-            self.project.root,
-        )
-        self.task_file = self.project.root / "TASKS.json"
-        write_json(self.task_file, self.normalized)
-        self.state = loopsail.create_state(self.normalized, self.task_file, self.project.root)
 
-    def test_selection_follows_dependencies(self) -> None:
-        self.assertEqual(loopsail.ready_task(self.normalized, self.state)["id"], "TASK-001")
-        self.state["tasks"]["TASK-001"]["status"] = "done"
-        self.assertEqual(loopsail.ready_task(self.normalized, self.state)["id"], "TASK-002")
+    def prepare(self) -> dict[str, object]:
+        code, envelope, stderr = self.project.call("slash", "prepare-step")
+        self.assertEqual(code, 3, envelope)
+        self.assertEqual(stderr, "")
+        self.assertTrue(envelope["ok"])
+        self.assertEqual(envelope["data"]["action"], "spawn_worker")
+        return envelope["data"]
 
-    def test_completed_definition_is_immutable(self) -> None:
-        previous = json.loads(json.dumps(self.normalized))
-        updated = json.loads(json.dumps(self.normalized))
-        updated["tasks"][0]["description"] = "changed"
-        self.state["tasks"]["TASK-001"]["status"] = "done"
-        with self.assertRaisesRegex(loopsail.LoopSailError, "completed task definition cannot change"):
-            loopsail.reconcile_task_list(self.project.root, updated, self.state, previous)
-
-    def test_removed_pending_task_becomes_superseded(self) -> None:
-        previous = json.loads(json.dumps(self.normalized))
-        updated = json.loads(json.dumps(self.normalized))
-        updated["tasks"] = updated["tasks"][:1]
-        loopsail.reconcile_task_list(self.project.root, updated, self.state, previous)
-        self.assertEqual(self.state["tasks"]["TASK-002"]["status"], "superseded")
-
-    def test_adding_task_does_not_bypass_an_existing_task_blocker(self) -> None:
-        previous = json.loads(json.dumps(self.normalized))
-        updated = json.loads(json.dumps(self.normalized))
-        updated["tasks"].append(task("TASK-003"))
-        self.state["tasks"]["TASK-001"]["status"] = "blocked"
-        self.state["active_task"] = "TASK-001"
-        self.state["project_status"] = "blocked"
-        loopsail.reconcile_task_list(self.project.root, updated, self.state, previous)
-        self.assertEqual(self.state["project_status"], "blocked")
-        self.assertEqual(self.state["active_task"], "TASK-001")
-
-    def test_completed_list_rejects_final_command_changes(self) -> None:
-        previous = json.loads(json.dumps(self.normalized))
-        updated = json.loads(json.dumps(self.normalized))
-        updated["final_verify_commands"] = [command("python3", "--version")]
-        self.state["project_status"] = "complete"
-        with self.assertRaisesRegex(loopsail.LoopSailError, "completed task list is frozen"):
-            loopsail.reconcile_task_list(self.project.root, updated, self.state, previous)
-
-    def test_experience_only_diff_does_not_block_unfinished_task_revision(self) -> None:
-        previous = json.loads(json.dumps(self.normalized))
-        updated = json.loads(json.dumps(self.normalized))
-        updated["tasks"][0]["description"] = "clarified after a blocker"
-        self.state["tasks"]["TASK-001"]["attempts"] = 2
-        self.state["tasks"]["TASK-001"]["attempt_sequence"] = 2
-        self.state["tasks"]["TASK-001"]["ai_retry_count"] = 1
-        (self.project.root / loopsail.LESSONS_FILE).write_text(
-            "# Test experience log\n\nBlocked attempt.\n", encoding="utf-8"
-        )
-
-        loopsail.reconcile_task_list(self.project.root, updated, self.state, previous)
-
-        self.assertEqual(self.state["tasks"]["TASK-001"]["status"], "pending")
-        self.assertEqual(self.state["tasks"]["TASK-001"]["attempts"], 0)
-        self.assertEqual(self.state["tasks"]["TASK-001"]["attempt_sequence"], 2)
-        self.assertEqual(self.state["tasks"]["TASK-001"]["ai_retry_count"], 1)
-
-    def test_repeated_unchanged_failure_blocks_early(self) -> None:
-        self.state["tasks"]["TASK-001"]["attempts"] = 1
-        first = loopsail.record_failure(self.state, "TASK-001", "Same failure", "tree")
-        self.assertFalse(first)
-        self.state["tasks"]["TASK-001"]["attempts"] = 2
-        second = loopsail.record_failure(self.state, "TASK-001", " same   failure ", "tree")
-        self.assertTrue(second)
-
-    def test_failed_lock_contender_cannot_unlink_or_bypass_active_lock(self) -> None:
-        lock_path = self.project.root / ".loopsail" / "lock"
-
-        with loopsail.project_lock(self.project.root):
-            self.assertTrue(lock_path.is_file())
-            with self.assertRaisesRegex(loopsail.LoopSailError, "already running"):
-                with loopsail.project_lock(self.project.root):
-                    self.fail("a second lock holder must not enter")
-            self.assertTrue(lock_path.is_file())
-            with self.assertRaisesRegex(loopsail.LoopSailError, "already running"):
-                with loopsail.project_lock(self.project.root):
-                    self.fail("a third lock holder must not enter")
-            self.assertTrue(lock_path.is_file())
-
-        self.assertFalse(lock_path.exists())
+    def complete_worker(self, content: str = "ok\n") -> dict[str, object]:
+        self.project.start_agent()
+        (self.project.root / "result.txt").write_text(content, encoding="utf-8")
+        result_value = self.project.worker_result(changed_files=["result.txt"])
+        self.assertEqual(self.project.stop_agent(result_value), "")
+        return result_value
 
 
-class LauncherTests(unittest.TestCase):
-    def test_json_tail_tolerates_shell_noise(self) -> None:
-        payload = loopsail.parse_json_tail("startup noise\n{\"structured_output\": {\"status\": \"ok\"}}\n")
-        self.assertEqual(payload["structured_output"]["status"], "ok")
+class ProtocolTests(unittest.TestCase):
+    def test_checked_in_schemas_are_generated_draft7_documents(self) -> None:
+        documents = protocol.schema_documents()
+        self.assertGreaterEqual(len(documents), 10)
+        for name, generated in documents.items():
+            checked = json.loads(
+                (SKILL_ROOT / "references" / name).read_text(encoding="utf-8")
+            )
+            self.assertEqual(checked, generated, name)
+            self.assertEqual(
+                checked["$schema"], "http://json-schema.org/draft-07/schema#", name
+            )
+            self.assertNotIn("$defs", json.dumps(checked), name)
 
-    def test_worker_launcher_supports_generic_prefix_and_does_not_select_model(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
-        (root / "CLAUDE.md").write_text("# Test\n", encoding="utf-8")
-        task_file = root / "TASKS.json"
-        task_value = task("TASK-001")
-        task_state = loopsail.new_task_state(task_value)
-        task_state["attempts"] = 1
-        config = json.loads(json.dumps(loopsail.DEFAULT_CONFIG))
-        config["claude"]["command_prefix"] = [
-            "bash",
-            "-lic",
-            "profile-claude \"$@\"",
-            "loopsail-claude",
-        ]
-        result = {
-            "structured_output": {
-                "task_id": "TASK-001",
-                "status": "completed",
-                "summary": "done",
-                "changed_files": [],
-                "verification_results": [],
-                "lessons": [],
-                "blocker": None,
-            }
+    def test_worker_result_is_strict_and_bound(self) -> None:
+        binding = {
+            "request_id": "r",
+            "list_id": "l",
+            "task_id": "T-001",
+            "attempt": 1,
         }
-        captured: list[str] = []
-
-        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            captured.extend(argv)
-            return subprocess.CompletedProcess(argv, 0, json.dumps(result), "shell startup warning")
-
-        with mock.patch.object(loopsail, "run_process", side_effect=fake_run):
-            worker_result, _ = loopsail.invoke_worker(root, task_file, task_value, task_state, config)
-        self.assertEqual(
-            captured[:4],
-            ["bash", "-lic", "profile-claude \"$@\"", "loopsail-claude"],
-        )
-        self.assertIn("--no-session-persistence", captured)
-        self.assertIn("--strict-mcp-config", captured)
-        self.assertIn("--disable-slash-commands", captured)
-        self.assertIn("--tools", captured)
-        self.assertNotIn("--model", captured)
-        self.assertEqual(worker_result["status"], "completed")
-
-    def test_worker_lessons_are_required_and_strictly_validated(self) -> None:
-        result: dict[str, object] = {
-            "task_id": "TASK-001",
+        value = {
+            "schema_version": 2,
+            "kind": "worker-result",
+            **binding,
             "status": "completed",
-            "summary": "done",
-            "changed_files": [],
+            "summary": "ok",
+            "changed_files": ["a.txt"],
             "verification_results": [],
-            "lessons": [lesson()],
+            "lessons": [],
             "blocker": None,
         }
-        self.assertEqual(
-            loopsail.validate_worker_result(result, "TASK-001")["lessons"], [lesson()]
-        )
-
-        missing = dict(result)
-        missing.pop("lessons")
-        with self.assertRaisesRegex(loopsail.LoopSailError, "invalid fields"):
-            loopsail.validate_worker_result(missing, "TASK-001")
-
-        too_many = dict(result)
-        too_many["lessons"] = [lesson() for _ in range(loopsail.MAX_LESSONS_PER_ATTEMPT + 1)]
-        with self.assertRaisesRegex(loopsail.LoopSailError, "at most"):
-            loopsail.validate_worker_result(too_many, "TASK-001")
-
-        unknown = dict(result)
-        bad_lesson = lesson(extra="not allowed")
-        unknown["lessons"] = [bad_lesson]
-        with self.assertRaisesRegex(loopsail.LoopSailError, "invalid fields"):
-            loopsail.validate_worker_result(unknown, "TASK-001")
-
-
-class DoctorTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-        self.config = json.loads(json.dumps(loopsail.DEFAULT_CONFIG))
-
-    def test_default_launcher_reports_active_profile_and_sanitized_auth(self) -> None:
-        calls: list[tuple[list[str], dict[str, str]]] = []
-
-        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            calls.append((list(argv), dict(kwargs["env"])))  # type: ignore[arg-type]
-            if argv[-1] == "--version":
-                return subprocess.CompletedProcess(argv, 0, "2.1.215 (Claude Code)\n", "")
-            return subprocess.CompletedProcess(
-                argv,
-                0,
-                "shell startup noise\n"
-                '{"loggedIn":true,"authMethod":"oauth_token",'
-                '"apiProvider":"firstParty","token":"must-not-leak"}\n',
-                "",
-            )
-
-        inherited = {
-            "CLAUDECODE": "1",
-            "CLAUDE_CODE_ENTRYPOINT": "outer-session",
-            "CLAUDE_CONFIG_DIR": "/tmp/Claude Profile A",
-            "ANTHROPIC_API_KEY": "test-anthropic-key",
-        }
-        output = io.StringIO()
-        with (
-            mock.patch.dict(os.environ, inherited, clear=True),
-            mock.patch.object(loopsail, "maybe_discover_project_root", return_value=self.root),
-            mock.patch.object(
-                loopsail, "load_config", return_value=(self.config, ["built-in defaults"])
-            ),
-            mock.patch.object(loopsail, "run_process", side_effect=fake_run),
-            contextlib.redirect_stdout(output),
+        self.assertIs(protocol.validate_worker_result(value, binding=binding), value)
+        for mutation in (
+            {**value, "extra": True},
+            {key: item for key, item in value.items() if key != "summary"},
+            {**value, "request_id": "wrong"},
+            {**value, "status": "blocked", "blocker": None},
         ):
-            self.assertEqual(
-                loopsail.command_doctor(argparse.Namespace(runner_config=None)), 0
-            )
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_worker_result(mutation, binding=binding)
 
-        payload = json.loads(output.getvalue())
-        self.assertEqual(calls[0][0], ["claude", "--version"])
-        self.assertEqual(calls[1][0], ["claude", "auth", "status", "--json"])
-        self.assertEqual(payload["launcher_kind"], "active-profile")
-        self.assertFalse(payload["launcher_overridden"])
-        self.assertEqual(
-            payload["claude_profile"]["inherited_config_dir"],
-            "/tmp/Claude Profile A",
-        )
-        self.assertEqual(payload["authentication"]["method"], "oauth_token")
-        self.assertEqual(payload["authentication"]["provider"], "firstParty")
-        self.assertNotIn("must-not-leak", output.getvalue())
-        for _, environment in calls:
-            self.assertNotIn("CLAUDECODE", environment)
-            self.assertFalse(any(key.startswith("CLAUDE_CODE_") for key in environment))
-            self.assertEqual(environment["CLAUDE_CONFIG_DIR"], "/tmp/Claude Profile A")
-            self.assertEqual(environment["ANTHROPIC_API_KEY"], "test-anthropic-key")
-
-    def test_profile_reporting_handles_default_empty_and_relative_paths(self) -> None:
-        fake_home = self.root / "home"
-        cases = (
-            ({}, fake_home / ".claude", "default"),
-            ({"CLAUDE_CONFIG_DIR": "   "}, fake_home / ".claude", "default"),
-            ({"CLAUDE_CONFIG_DIR": "profiles/work"}, self.root / "profiles/work", "CLAUDE_CONFIG_DIR"),
-        )
-        for environment, expected, source in cases:
-            with self.subTest(environment=environment), mock.patch.dict(
-                os.environ, environment, clear=True
-            ), mock.patch.object(loopsail.Path, "home", return_value=fake_home), working_directory(
-                self.root
-            ):
-                profile = loopsail.active_claude_profile()
-                self.assertEqual(profile["inherited_config_dir"], str(expected.resolve()))
-                self.assertEqual(profile["source"], source)
-
-    def test_doctor_fails_closed_for_authentication_errors(self) -> None:
-        version = subprocess.CompletedProcess(
-            ["claude", "--version"], 0, "2.1.215 (Claude Code)\n", ""
-        )
-        cases = (
-            (
-                "authentication command failure",
-                subprocess.CompletedProcess(["claude", "auth"], 7, "", "failed"),
-                "authentication check",
-            ),
-            (
-                "malformed status",
-                subprocess.CompletedProcess(["claude", "auth"], 0, "not-json", ""),
-                "not valid JSON",
-            ),
-            (
-                "logged out",
-                subprocess.CompletedProcess(
-                    ["claude", "auth"], 0, '{"loggedIn":false}', ""
-                ),
-                "not authenticated",
-            ),
-            (
-                "invalid method",
-                subprocess.CompletedProcess(
-                    ["claude", "auth"],
-                    0,
-                    '{"loggedIn":true,"authMethod":{"unexpected":true}}',
-                    "",
-                ),
-                "method was invalid",
-            ),
-        )
-        for label, auth_result, message in cases:
-            with (
-                self.subTest(label=label),
-                mock.patch.object(
-                    loopsail, "maybe_discover_project_root", return_value=self.root
-                ),
-                mock.patch.object(
-                    loopsail,
-                    "load_config",
-                    return_value=(self.config, ["built-in defaults"]),
-                ),
-                mock.patch.object(
-                    loopsail, "run_process", side_effect=[version, auth_result]
-                ),
-                self.assertRaisesRegex(loopsail.LoopSailError, message),
-            ):
-                loopsail.command_doctor(argparse.Namespace(runner_config=None))
-
-
-class WorkerEnvTests(unittest.TestCase):
-    def test_outer_claude_session_markers_are_removed_from_worker_environment(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
-        (root / "CLAUDE.md").write_text("# Test\n", encoding="utf-8")
-        task_file = root / "TASKS.json"
-        task_value = task("TASK-001")
-        task_state = loopsail.new_task_state(task_value)
-        task_state["attempts"] = 1
-        config = json.loads(json.dumps(loopsail.DEFAULT_CONFIG))
-        result = {
-            "structured_output": {
-                "task_id": "TASK-001",
-                "status": "completed",
-                "summary": "done",
-                "changed_files": [],
-                "verification_results": [],
-                "lessons": [],
-                "blocker": None,
-            }
-        }
-        captured_env: dict[str, str] = {}
-        captured_argv: list[str] = []
-
-        def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-            captured_argv.extend(argv)
-            captured_env.update(kwargs["env"])  # type: ignore[arg-type]
-            return subprocess.CompletedProcess(argv, 0, json.dumps(result), "")
-
-        inherited = {
-            "CLAUDECODE": "1",
-            "CLAUDE_CODE_ENTRYPOINT": "outer-session",
-            "CLAUDE_CODE_TEST_MARKER": "remove-me",
-            "CLAUDE_CONFIG_DIR": "/tmp/test claude profile",
-            "ANTHROPIC_API_KEY": "test-anthropic-key",
-        }
-        with mock.patch.dict(os.environ, inherited), mock.patch.object(
-            loopsail, "run_process", side_effect=fake_run
-        ):
-            loopsail.invoke_worker(root, task_file, task_value, task_state, config)
-
-        self.assertNotIn("CLAUDECODE", captured_env)
-        self.assertFalse(any(key.startswith("CLAUDE_CODE_") for key in captured_env))
-        self.assertEqual(captured_argv[0], "claude")
-        self.assertEqual(captured_env["CLAUDE_CONFIG_DIR"], inherited["CLAUDE_CONFIG_DIR"])
-        self.assertEqual(captured_env["ANTHROPIC_API_KEY"], inherited["ANTHROPIC_API_KEY"])
-        self.assertEqual(captured_env["LOOPSAIL_PROJECT_ROOT"], str(root))
-        self.assertEqual(captured_env["LOOPSAIL_TASK_FILE"], str(task_file))
-        self.assertEqual(captured_env["LOOPSAIL_TOOL_DIR"], str(loopsail.TOOL_ROOT))
-        self.assertIn("LOOPSAIL_ALLOWED_PATHS", captured_env)
-        self.assertIn("LOOPSAIL_PROTECTED_PATHS", captured_env)
-
-
-class ExperienceLogTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-
-    def test_missing_symlink_and_non_utf8_logs_fail_closed(self) -> None:
-        with self.assertRaisesRegex(loopsail.LoopSailError, "missing or unsafe"):
-            loopsail.require_safe_experience_file(self.root)
-
-        outside = self.root / "outside.md"
-        outside.write_text("# Outside\n", encoding="utf-8")
-        (self.root / loopsail.LESSONS_FILE).symlink_to(outside)
-        with self.assertRaisesRegex(loopsail.LoopSailError, "missing or unsafe"):
-            loopsail.require_safe_experience_file(self.root)
-
-        (self.root / loopsail.LESSONS_FILE).unlink()
-        (self.root / loopsail.LESSONS_FILE).write_bytes(b"\xff\xfe")
-        with self.assertRaisesRegex(loopsail.LoopSailError, "UTF-8"):
-            loopsail.require_safe_experience_file(self.root)
-
-    def test_atomic_write_failure_is_reported_as_an_experience_error(self) -> None:
-        (self.root / loopsail.LESSONS_FILE).write_text("# Experience\n", encoding="utf-8")
-        with mock.patch.object(loopsail, "atomic_write_bytes", side_effect=OSError("read only")):
-            with self.assertRaisesRegex(loopsail.LoopSailError, "cannot safely update"):
-                loopsail.append_experience_record(
-                    self.root,
-                    task_list(task("TASK-001")),
-                    task_id="TASK-001",
-                    title="Test",
-                    attempt=1,
-                    outcome="阻塞",
-                    stage="任务验证",
-                    lessons=[],
-                    failure="failed",
-                )
-
-
-class StepModeTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.project = TemporaryGitProject()
-        self.addCleanup(self.project.close)
-        self.task_file = self.project.root / "TASKS.json"
-        write_json(self.task_file, task_list(task("TASK-001")))
-        previous = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, previous)
-
-    def call_once(self) -> tuple[int, dict[str, object], str]:
-        output = io.StringIO()
-        args = argparse.Namespace(
-            task_list=self.task_file,
-            runner_config=None,
-            once=True,
-        )
-        with contextlib.redirect_stdout(output):
-            exit_code = loopsail.command_run(args)
-        stdout = output.getvalue()
-        last_line = stdout.rstrip().splitlines()[-1]
-        return exit_code, json.loads(last_line), stdout
-
-    def initialize_state(
-        self,
-    ) -> tuple[dict[str, object], Path, Path, Path, bool]:
-        task_file, normalized = loopsail.load_task_input(self.task_file, self.project.root)
-        return loopsail.initialize_or_load_state(self.project.root, task_file, normalized)
-
-    def assert_last_step(self, expected: dict[str, object]) -> None:
-        report_path = (
-            self.project.root
-            / ".loopsail"
-            / "runs"
-            / "test-run"
-            / loopsail.STEP_REPORT_FILE
-        )
-        self.assertEqual(loopsail.load_json(report_path), expected)
-
-    @staticmethod
-    def successful_worker(
-        root: Path,
-        task_file: Path,
-        task_value: dict[str, object],
-        task_state: dict[str, object],
-        config: dict[str, object],
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        changed = f"result-{task_value['id']}.txt"
-        (root / changed).write_text("implemented\n", encoding="utf-8")
-        return (
-            {
-                "task_id": task_value["id"],
-                "status": "completed",
-                "summary": "implemented",
-                "changed_files": [changed],
-                "verification_results": [],
-                "lessons": [],
-                "blocker": None,
+    def test_worker_request_rejects_missing_extra_and_task_binding(self) -> None:
+        value = {
+            "schema_version": 2,
+            "kind": "worker-request",
+            "request_id": "r",
+            "list_id": "list",
+            "project": "project",
+            "branch": "loopsail/list",
+            "task_id": "T-001",
+            "attempt": 1,
+            "task": {"id": "T-001"},
+            "previous_failure": None,
+            "policy": {
+                "allowed_paths": [],
+                "protected_paths": [".loopsail/**"],
+                "request_path": ".loopsail/input/list/r.json",
             },
-            {"exit_code": 0, "duration_seconds": 0.01},
-        )
-
-    @staticmethod
-    def no_change_worker(
-        root: Path,
-        task_file: Path,
-        task_value: dict[str, object],
-        task_state: dict[str, object],
-        config: dict[str, object],
-    ) -> tuple[dict[str, object], dict[str, object]]:
-        return (
-            {
-                "task_id": task_value["id"],
-                "status": "completed",
-                "summary": "verification will fail",
-                "changed_files": [],
-                "verification_results": [],
-                "lessons": [],
-                "blocker": None,
-            },
-            {"exit_code": 0, "duration_seconds": 0.01},
-        )
-
-    def test_once_advances_two_tasks_then_runs_final_verification(self) -> None:
-        write_json(
-            self.task_file,
-            task_list(
-                task("TASK-001"),
-                task("TASK-002", dependencies=["TASK-001"]),
-            ),
-        )
-
-        with mock.patch.object(
-            loopsail, "invoke_worker", side_effect=self.successful_worker
-        ) as worker:
-            first_code, first, first_stdout = self.call_once()
-            self.assertEqual(first_code, 3)
-            self.assertEqual(first["exit_code"], 3)
-            self.assertEqual(first["kind"], "attempt")
-            self.assertTrue(first["performed"])
-            self.assertEqual(first["project_status"], "executing")
-            self.assertEqual(first["task"]["id"], "TASK-001")
-            self.assertEqual(first["task"]["status"], "done")
-            self.assertEqual(first["task"]["attempt"], 1)
-            self.assertEqual(first["task"]["attempts"], 1)
-            self.assertIsNotNone(first["task"]["commit"])
-            self.assertIsNone(first["task"]["failure"])
-            self.assertEqual(
-                first["next_ready_task"], {"id": "TASK-002", "title": "TASK-002"}
-            )
-            self.assertEqual(first["tasks_remaining"], 1)
-            self.assertEqual(json.loads(first_stdout.rstrip().splitlines()[-1]), first)
-            self.assert_last_step(first)
-
-            second_code, second, second_stdout = self.call_once()
-            self.assertEqual(second_code, 3)
-            self.assertEqual(second["exit_code"], 3)
-            self.assertEqual(second["kind"], "attempt")
-            self.assertEqual(second["task"]["id"], "TASK-002")
-            self.assertEqual(second["task"]["status"], "done")
-            self.assertEqual(second["tasks_remaining"], 0)
-            self.assertIsNone(second["next_ready_task"])
-            self.assertEqual(json.loads(second_stdout.rstrip().splitlines()[-1]), second)
-            self.assert_last_step(second)
-
-            final_code, final, final_stdout = self.call_once()
-            self.assertEqual(final_code, 0)
-            self.assertEqual(final["exit_code"], 0)
-            self.assertEqual(final["kind"], "final-verification")
-            self.assertTrue(final["performed"])
-            self.assertEqual(final["project_status"], "complete")
-            self.assertEqual(final["final_verification"]["status"], "passed")
-            self.assertIsNone(final["final_verification"]["failure"])
-            self.assertEqual(json.loads(final_stdout.rstrip().splitlines()[-1]), final)
-            self.assert_last_step(final)
-
-        self.assertEqual(worker.call_count, 2)
-
-    def test_retryable_failure_then_repeated_fingerprint_blocks(self) -> None:
-        value = task_list(task("TASK-001"))
-        value["tasks"][0]["verify_commands"] = [
-            command("python3", "-c", "raise SystemExit(9)")
-        ]
-        write_json(self.task_file, value)
-
-        with mock.patch.object(
-            loopsail, "invoke_worker", side_effect=self.no_change_worker
-        ) as worker:
-            first_code, first, _ = self.call_once()
-            second_code, second, _ = self.call_once()
-
-        self.assertEqual(first_code, 3)
-        self.assertEqual(first["kind"], "attempt")
-        self.assertEqual(first["task"]["status"], "pending")
-        self.assertEqual(first["task"]["attempt"], 1)
-        self.assertEqual(
-            first["task"]["attempt_log"],
-            loopsail.experience_log_reference("test-run", "TASK-001", 1),
-        )
-        self.assertEqual(second_code, 2)
-        self.assertEqual(second["exit_code"], 2)
-        self.assertEqual(second["kind"], "attempt")
-        self.assertEqual(second["project_status"], "blocked")
-        self.assertEqual(second["task"]["status"], "blocked")
-        self.assertEqual(second["task"]["attempt"], 2)
-        self.assertEqual(second["task"]["ai_retry_count"], 0)
-        self.assertEqual(second["task"]["ai_retries_remaining"], 1)
-        self.assertTrue(second["blocked_reason"])
-        self.assert_last_step(second)
-        self.assertEqual(worker.call_count, 2)
-
-    def test_entry_blocked_is_structured_once_but_full_run_keeps_error(self) -> None:
-        state, state_path, _, _, _ = self.initialize_state()
-        item = state["tasks"]["TASK-001"]
-        item.update(
-            {
-                "status": "blocked",
-                "attempts": 1,
-                "attempt_sequence": 1,
-                "last_failure": {
-                    "summary": "environment unavailable",
-                    "fingerprint": "tree",
-                    "recorded_at": loopsail.utc_now(),
-                },
-            }
-        )
-        state["active_task"] = "TASK-001"
-        state["project_status"] = "blocked"
-        loopsail.atomic_write_json(state_path, state)
-
-        with mock.patch.object(loopsail, "invoke_worker") as worker:
-            exit_code, report, _ = self.call_once()
-        worker.assert_not_called()
-        self.assertEqual(exit_code, 2)
-        self.assertEqual(report["kind"], "blocked")
-        self.assertFalse(report["performed"])
-        self.assertEqual(report["task"]["id"], "TASK-001")
-        self.assertEqual(report["blocked_reason"], "environment unavailable")
-        self.assert_last_step(report)
-
-        args = argparse.Namespace(
-            task_list=self.task_file,
-            runner_config=None,
-            once=False,
-        )
-        with self.assertRaisesRegex(
-            loopsail.LoopSailError,
-            "run is blocked at TASK-001; update the list or use "
-            "/loopsail:retry TASK-001",
+            "created_at": "2026-01-01T00:00:00+00:00",
+        }
+        self.assertIs(protocol.validate_worker_request(value), value)
+        for mutation in (
+            {**value, "extra": True},
+            {key: item for key, item in value.items() if key != "policy"},
+            {**value, "task": {"id": "T-002"}},
         ):
-            loopsail.command_run(args)
+            with self.subTest(mutation=mutation):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.validate_worker_request(mutation)
 
-    def test_already_complete_report_contains_schema_required_keys(self) -> None:
-        state, state_path, _, _, _ = self.initialize_state()
-        state["tasks"]["TASK-001"].update(
-            {"status": "done", "commit": state["base_commit"]}
-        )
-        state["project_status"] = "complete"
-        state["active_task"] = None
-        state["final_verification"] = {
-            "status": "passed",
-            "commands": [],
-            "failure": None,
-            "at": loopsail.utc_now(),
+    def test_task_list_v1_is_explicitly_unsupported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            old = task_list()
+            old.pop("kind")
+            old["schema_version"] = 1
+            with self.assertRaises(loopsail.LoopSailError) as caught:
+                loopsail.validate_task_list(old, root)
+            self.assertEqual(caught.exception.code, "unsupported_schema_version")
+
+    def test_config_v2_accepts_only_three_business_fields(self) -> None:
+        value = {
+            "schema_version": 2,
+            "kind": "loopsail-config",
+            "protected_paths": ["generated/**"],
+            "verification_output_limit_bytes": 10,
+            "event_log_max_bytes": 20,
         }
-        loopsail.atomic_write_json(state_path, state)
+        loopsail.validate_config(value)
+        for legacy in ("claude", "worker_timeout_seconds", "max_budget_usd"):
+            with self.subTest(legacy=legacy):
+                with self.assertRaises(loopsail.LoopSailError):
+                    loopsail.validate_config({**value, legacy: {}})
 
-        with mock.patch.object(loopsail, "invoke_worker") as worker:
-            exit_code, report, _ = self.call_once()
-        worker.assert_not_called()
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(report["kind"], "already-complete")
-        self.assertFalse(report["performed"])
-        self.assertEqual(report["project_status"], "complete")
-        schema = loopsail.load_json(loopsail.SCHEMA_DIR / "step-report.schema.json")
-        self.assertLessEqual(set(schema["required"]), set(report))
-        self.assert_last_step(report)
-
-    def test_idle_report_is_defensive_and_does_not_invoke_worker(self) -> None:
-        write_json(
-            self.task_file,
-            task_list(
-                task("TASK-001"),
-                task("TASK-002", dependencies=["TASK-001"]),
-            ),
-        )
-        state, state_path, _, _, _ = self.initialize_state()
-        state["tasks"]["TASK-001"]["status"] = "superseded"
-        state["tasks"]["TASK-002"]["status"] = "pending"
-        state["project_status"] = "executing"
-        state["active_task"] = None
-        loopsail.atomic_write_json(state_path, state)
-
-        with mock.patch.object(loopsail, "invoke_worker") as worker:
-            exit_code, report, _ = self.call_once()
-        worker.assert_not_called()
-        self.assertEqual(exit_code, 4)
-        self.assertEqual(report["exit_code"], 4)
-        self.assertEqual(report["kind"], "idle")
-        self.assertFalse(report["performed"])
-        self.assertEqual(report["project_status"], "executing")
-        self.assertEqual(report["tasks_remaining"], 1)
-        self.assert_last_step(report)
-
-    def test_resume_is_one_step_and_never_launches_a_new_worker(self) -> None:
-        state, state_path, _, _, _ = self.initialize_state()
-        state["tasks"]["TASK-001"].update(
-            {"status": "running", "attempts": 1, "attempt_sequence": 1}
-        )
-        state["active_task"] = "TASK-001"
-        loopsail.atomic_write_json(state_path, state)
-        (self.project.root / "result.txt").write_text("recovered\n", encoding="utf-8")
-
-        with mock.patch.object(loopsail, "invoke_worker") as worker:
-            exit_code, report, _ = self.call_once()
-        worker.assert_not_called()
-        self.assertEqual(exit_code, 3)
-        self.assertEqual(report["kind"], "resume")
-        self.assertTrue(report["performed"])
-        self.assertEqual(report["task"]["id"], "TASK-001")
-        self.assertEqual(report["task"]["status"], "done")
-        self.assertIsNotNone(report["task"]["commit"])
-        self.assertEqual(report["tasks_remaining"], 0)
-        self.assert_last_step(report)
-
-
-class GitIntegrationTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.project = TemporaryGitProject()
-        self.addCleanup(self.project.close)
-        self.task_file = self.project.root / "TASKS.json"
-        write_json(self.task_file, task_list(task("TASK-001")))
-
-    def test_run_creates_branch_verifies_and_commits(self) -> None:
-        original_lessons = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            (root / "result.txt").write_text("implemented\n", encoding="utf-8")
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "completed",
-                    "summary": "implemented",
-                    "changed_files": ["result.txt"],
-                    "verification_results": [],
-                    "lessons": [],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
+    def test_task_dependencies_cycles_and_context_are_semantic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "CLAUDE.md").write_text("# rules\n", encoding="utf-8")
+            valid = task_list(
+                task("A-001"),
+                task("A-002", depends_on=["A-001"]),
             )
-
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = loopsail.command_run(args)
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(self.project.git("branch", "--show-current").stdout.strip(), "loopsail/test-run")
-        message = self.project.git("show", "-s", "--format=%B", "HEAD").stdout
-        self.assertIn("LoopSail-List: test-run", message)
-        self.assertIn("LoopSail-Task: TASK-001", message)
-        state = loopsail.load_json(self.project.root / ".loopsail" / "runs" / "test-run" / "state.json")
-        self.assertEqual(state["project_status"], "complete")
-        self.assertEqual(state["tasks"]["TASK-001"]["status"], "done")
-        last_step = loopsail.load_json(
-            self.project.root
-            / ".loopsail"
-            / "runs"
-            / "test-run"
-            / loopsail.STEP_REPORT_FILE
-        )
-        self.assertEqual(last_step["kind"], "final-verification")
-        self.assertEqual(last_step["exit_code"], 0)
-        self.assertEqual(last_step["project_status"], "complete")
-        self.assertEqual(
-            (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8"),
-            original_lessons,
-        )
-
-    def test_successful_task_records_sanitized_lessons_in_the_same_commit(self) -> None:
-        private_root = str(self.project.root)
-
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            (root / "result.txt").write_text("implemented\n", encoding="utf-8")
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "completed",
-                    "summary": "implemented",
-                    "changed_files": ["result.txt"],
-                    "verification_results": [],
-                    "lessons": [
-                        lesson(
-                            challenge=(
-                                f"在 {private_root}/private.py 定位失败\n"
-                                "<!-- injected --> token=super-secret-value，"
-                                "并误读了 /opt/private/corpus.txt"
-                            )
-                        )
-                    ],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
+            normalized = loopsail.validate_task_list(valid, root)
+            self.assertEqual(normalized["tasks"][1]["depends_on"], ["A-001"])
+            unknown = task_list(task("A-001", depends_on=["missing"]))
+            with self.assertRaisesRegex(loopsail.LoopSailError, "unknown dependency"):
+                loopsail.validate_task_list(unknown, root)
+            cycle = task_list(
+                task("A-001", depends_on=["A-002"]),
+                task("A-002", depends_on=["A-001"]),
             )
+            with self.assertRaisesRegex(loopsail.LoopSailError, "cycle"):
+                loopsail.validate_task_list(cycle, root)
 
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(loopsail.command_run(args), 0)
 
-        content = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        self.assertIn("### 经验 1", content)
-        self.assertIn("[project-root]/private.py", content)
-        self.assertIn("token=[REDACTED]", content)
-        self.assertNotIn(private_root, content)
-        self.assertNotIn("injected", content)
-        self.assertNotIn("super-secret-value", content)
-        self.assertNotIn("/opt/private/corpus.txt", content)
-        self.assertIn("[absolute-path]", content)
-        committed = self.project.git(
-            "-c", "core.quotePath=false", "show", "--pretty=", "--name-only", "HEAD"
-        ).stdout.splitlines()
-        self.assertIn("result.txt", committed)
-        self.assertIn(loopsail.LESSONS_FILE, committed)
-
-    def test_failed_attempts_are_recorded_without_changing_the_diff_fingerprint(self) -> None:
-        value = task_list(task("TASK-001"))
-        value["tasks"][0]["verify_commands"] = [
-            command("python3", "-c", "raise SystemExit(9)")
+class EnvelopeTests(ProjectTestCase):
+    def test_actions_emit_one_envelope_and_matching_exit_code(self) -> None:
+        actions = [
+            ("doctor",),
+            ("slash", "validate"),
+            ("slash", "status"),
+            ("slash", "init-check"),
         ]
-        write_json(self.task_file, value)
+        for action in actions:
+            with self.subTest(action=action):
+                code, envelope, stderr = self.project.call(*action)
+                self.assertEqual(stderr, "")
+                self.assertEqual(code, envelope["exit_code"])
+                self.assertEqual(envelope["kind"], "command-envelope")
+                self.assertEqual(set(envelope), {
+                    "schema_version", "kind", "ok", "exit_code", "at", "data", "error"
+                })
 
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "completed",
-                    "summary": "verification will fail",
-                    "changed_files": [],
-                    "verification_results": [],
-                    "lessons": [],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
-            )
+    def test_expected_error_is_also_an_envelope(self) -> None:
+        code, envelope, stderr = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], "loopsail_error")
 
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(loopsail.command_run(args), 2)
+    def test_unsupported_v1_error_has_stable_code(self) -> None:
+        old = task_list()
+        old["schema_version"] = 1
+        old.pop("kind")
+        self.project.write_tasks(old)
+        code, envelope, stderr = self.project.call("slash", "validate")
+        self.assertEqual(code, 2)
+        self.assertEqual(stderr, "")
+        self.assertEqual(envelope["error"]["code"], "unsupported_schema_version")
 
-        state = loopsail.load_json(
-            self.project.root / ".loopsail" / "runs" / "test-run" / "state.json"
-        )
-        self.assertEqual(state["tasks"]["TASK-001"]["attempts"], 2)
-        self.assertEqual(state["tasks"]["TASK-001"]["status"], "blocked")
-        content = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        self.assertEqual(content.count("### 自动失败记录"), 2)
+
+class PrepareFinalizeTests(ProjectTestCase):
+    def test_success_uses_actual_diff_verifies_and_commits(self) -> None:
+        report = self.prepare()
+        request = self.project.request()
+        self.assertEqual(request["kind"], "worker-request")
+        self.assertEqual(request["task_id"], "T-001")
+        self.assertEqual(report["request_path"], request["policy"]["request_path"])
+        self.complete_worker()
+
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 3, envelope)
+        self.assertEqual(envelope["data"]["action"], "finalized")
+        state = self.project.state()
+        item = state["tasks"]["T-001"]
+        self.assertEqual(item["status"], "done")
+        self.assertIsNone(state["active_request"])
         self.assertEqual(
-            loopsail.diff_fingerprint(self.project.root, [loopsail.LESSONS_FILE]),
-            hashlib.sha256().hexdigest(),
+            self.project.git("show", "--format=%B", "--no-patch", "HEAD").stdout.splitlines()[0],
+            "loopsail(T-001): Task T-001",
         )
-
-    def test_worker_experience_log_mutation_blocks_immediately(self) -> None:
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            (root / loopsail.LESSONS_FILE).write_text("tampered\n", encoding="utf-8")
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "completed",
-                    "summary": "tampered",
-                    "changed_files": [loopsail.LESSONS_FILE],
-                    "verification_results": [],
-                    "lessons": [],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
-            )
-
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(loopsail.command_run(args), 2)
-
-        state = loopsail.load_json(
-            self.project.root / ".loopsail" / "runs" / "test-run" / "state.json"
+        attempt = json.loads(
+            (
+                self.project.root
+                / ".loopsail/logs/test-list/T-001-attempt-1.json"
+            ).read_text(encoding="utf-8")
         )
-        self.assertEqual(state["tasks"]["TASK-001"]["status"], "blocked")
-        self.assertIn("experience log", state["tasks"]["TASK-001"]["last_failure"]["summary"])
+        self.assertEqual(attempt["actual_diff"], ["result.txt"])
+        self.assertEqual(attempt["status"], "done")
+        self.assertEqual(attempt["agent_id"], "agent-1")
 
-    def test_worker_blocker_records_structured_lessons(self) -> None:
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "blocked",
-                    "summary": "requirement is ambiguous",
-                    "changed_files": [],
-                    "verification_results": [],
-                    "lessons": [
-                        lesson(
-                            challenge="接口错误语义不明确",
-                            root_cause="任务没有规定兼容行为",
-                            resolution=None,
-                            takeaway="涉及公开接口兼容性时应在任务验收条件中明确错误语义",
+        before = self.project.git("rev-list", "--count", "HEAD").stdout.strip()
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        after = self.project.git("rev-list", "--count", "HEAD").stdout.strip()
+        self.assertEqual(code, 3)
+        self.assertFalse(envelope["data"]["performed"])
+        self.assertEqual(before, after)
+
+        code, envelope, _ = self.project.call("slash", "prepare-step")
+        self.assertEqual(code, 0, envelope)
+        self.assertEqual(envelope["data"]["action"], "complete")
+        self.assertEqual(self.project.state()["project_status"], "complete")
+        final_log = json.loads(
+            (
+                self.project.root / ".loopsail/logs/test-list/FINAL-attempt-1.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(final_log["kind"], "attempt-log")
+        self.assertEqual(final_log["status"], "done")
+
+    def test_worker_blocker_is_immediate(self) -> None:
+        self.prepare()
+        self.project.start_agent()
+        value = self.project.worker_result(status="blocked", blocker="needs credentials")
+        self.project.stop_agent(value)
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "worker_blocked")
+        self.assertEqual(self.project.state()["tasks"]["T-001"]["status"], "blocked")
+
+    def test_missing_result_retries_once_then_repeated_fingerprint_blocks(self) -> None:
+        self.prepare()
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 3, envelope)
+        self.assertEqual(self.project.state()["tasks"]["T-001"]["status"], "pending")
+        self.prepare()
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "worker_result_missing")
+        self.assertEqual(self.project.state()["tasks"]["T-001"]["status"], "blocked")
+
+    def test_three_distinct_verification_failures_reach_attempt_limit(self) -> None:
+        for attempt in range(1, 4):
+            self.prepare()
+            self.complete_worker(content=f"wrong-{attempt}\n")
+            code, envelope, _ = self.project.call("slash", "finalize-step")
+            self.assertEqual(code, 2 if attempt == 3 else 3, envelope)
+        item = self.project.state()["tasks"]["T-001"]
+        self.assertEqual(item["attempts"], 3)
+        self.assertEqual(item["status"], "blocked")
+
+    def test_prepare_detects_orphaned_lease_and_preserves_diff(self) -> None:
+        self.prepare()
+        (self.project.root / "result.txt").write_text("partial\n", encoding="utf-8")
+        code, envelope, _ = self.project.call("slash", "prepare-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "orphaned_attempt_lease")
+        self.assertTrue((self.project.root / "result.txt").is_file())
+        self.assertEqual(self.project.state()["tasks"]["T-001"]["status"], "blocked")
+
+    def test_active_lease_blocks_a_second_task_list(self) -> None:
+        self.prepare()
+        self.project.write_tasks(task_list(task(), list_id="other-list"))
+        code, envelope, _ = self.project.call("slash", "prepare-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "concurrent_attempt_lease")
+
+    def test_scope_violation_blocks_even_if_worker_reports_no_files(self) -> None:
+        self.prepare()
+        self.project.start_agent()
+        (self.project.root / "outside.md").write_text("bad\n", encoding="utf-8")
+        self.project.stop_agent(self.project.worker_result())
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "scope_violation")
+        self.assertIn("outside.md", envelope["error"]["message"])
+
+    def test_worker_git_mutation_is_detected_authoritatively(self) -> None:
+        self.prepare()
+        self.project.start_agent()
+        (self.project.root / "result.txt").write_text("ok\n", encoding="utf-8")
+        self.project.git("add", "result.txt")
+        self.project.git("commit", "-m", "worker must not commit")
+        self.project.stop_agent(
+            self.project.worker_result(changed_files=["result.txt"])
+        )
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "git_state_changed")
+
+    def test_task_and_experience_integrity_are_authoritative(self) -> None:
+        for target, expected in (("task", "task_input_changed"), ("experience", "experience_changed")):
+            with self.subTest(target=target):
+                project = GitProject()
+                try:
+                    code, envelope, _ = project.call("slash", "prepare-step")
+                    self.assertEqual(code, 3, envelope)
+                    project.start_agent()
+                    (project.root / "result.txt").write_text("ok\n", encoding="utf-8")
+                    project.stop_agent(project.worker_result(changed_files=["result.txt"]))
+                    if target == "task":
+                        value = task_list(task(description="changed while running"))
+                        project.write_tasks(value)
+                    else:
+                        (project.root / loopsail.LESSONS_FILE).write_text(
+                            "# changed by worker\n", encoding="utf-8"
                         )
-                    ],
-                    "blocker": "缺少公开接口错误语义",
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
-            )
+                    code, envelope, _ = project.call("slash", "finalize-step")
+                    self.assertEqual(code, 2)
+                    self.assertEqual(envelope["error"]["code"], expected)
+                finally:
+                    project.close()
 
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(loopsail.command_run(args), 2)
+    def test_verification_and_final_verification_fail_closed(self) -> None:
+        self.prepare()
+        self.complete_worker(content="wrong\n")
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 3)
+        self.assertFalse(envelope["data"]["blocked_reason"])
+        self.assertEqual(self.project.state()["tasks"]["T-001"]["status"], "pending")
 
-        content = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        self.assertIn("Worker 主动阻塞", content)
-        self.assertIn("接口错误语义不明确", content)
-        self.assertIn("尚未解决", content)
+        other = GitProject()
+        try:
+            other.write_tasks(task_list(task(), final_passes=False))
+            code, _, _ = other.call("slash", "prepare-step")
+            self.assertEqual(code, 3)
+            other.start_agent()
+            (other.root / "result.txt").write_text("ok\n", encoding="utf-8")
+            other.stop_agent(other.worker_result(changed_files=["result.txt"]))
+            code, _, _ = other.call("slash", "finalize-step")
+            self.assertEqual(code, 3)
+            code, envelope, _ = other.call("slash", "prepare-step")
+            self.assertEqual(code, 2)
+            self.assertEqual(envelope["error"]["code"], "final_verification_failed")
+            self.assertEqual(other.state()["project_status"], "blocked")
+        finally:
+            other.close()
 
-    def test_worker_process_failure_gets_an_automatic_record(self) -> None:
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(
-            loopsail, "invoke_worker", side_effect=loopsail.LoopSailError("launcher unavailable")
-        ):
-            with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(loopsail.command_run(args), 2)
 
-        state = loopsail.load_json(
-            self.project.root / ".loopsail" / "runs" / "test-run" / "state.json"
-        )
-        self.assertEqual(state["tasks"]["TASK-001"]["attempts"], 2)
-        content = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        self.assertEqual(content.count("### 自动失败记录"), 2)
-        self.assertIn("Worker 进程未成功返回有效结构化结果", content)
-        self.assertNotIn("launcher unavailable", content)
+class HookTests(ProjectTestCase):
+    def test_worker_without_active_request_fails_closed(self) -> None:
+        payload = {
+            "agent_type": "loopsail:worker",
+            "agent_id": "agent-1",
+            "cwd": str(self.project.root),
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(self.project.root / "CLAUDE.md")},
+        }
+        with self.assertRaises(hook.HookError):
+            hook.pre_tool_use(payload)
 
-    def test_final_failure_requires_a_new_repair_task(self) -> None:
-        value = task_list(task("TASK-001"))
-        value["final_verify_commands"] = [command("python3", "-c", "raise SystemExit(4)")]
-        write_json(self.task_file, value)
-
-        def fake_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            (root / "result.txt").write_text("implemented\n", encoding="utf-8")
-            return (
-                {
-                    "task_id": task_value["id"],
-                    "status": "completed",
-                    "summary": "implemented",
-                    "changed_files": ["result.txt"],
-                    "verification_results": [],
-                    "lessons": [],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
-            )
-
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=fake_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = loopsail.command_run(args)
-        self.assertEqual(exit_code, 2)
-        state = loopsail.load_json(self.project.root / ".loopsail" / "runs" / "test-run" / "state.json")
-        self.assertEqual(state["project_status"], "blocked")
-        self.assertIsNone(state["active_task"])
-        lessons = (self.project.root / loopsail.LESSONS_FILE).read_text(encoding="utf-8")
-        self.assertIn("最终验证阻塞", lessons)
-        self.assertIn("FINAL-attempt-1.json", lessons)
-
-        value["final_verify_commands"] = [command("python3", "-c", "raise SystemExit(0)")]
-        write_json(self.task_file, value)
-        with self.assertRaisesRegex(loopsail.LoopSailError, "requires a new repair task"):
-            loopsail.initialize_or_load_state(self.project.root, self.task_file, loopsail.validate_task_list(value, self.project.root))
-
-    def test_interrupted_running_diff_is_verified_and_committed_without_new_worker(self) -> None:
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        task_file, normalized = loopsail.load_task_input(self.task_file, self.project.root)
-        state, state_path, _, _, _ = loopsail.initialize_or_load_state(
-            self.project.root, task_file, normalized
-        )
-        item = state["tasks"]["TASK-001"]
-        item["status"] = "running"
-        item["attempts"] = 1
-        state["active_task"] = "TASK-001"
-        loopsail.atomic_write_json(state_path, state)
-        (self.project.root / "result.txt").write_text("recovered\n", encoding="utf-8")
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker") as worker:
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = loopsail.command_run(args)
-        self.assertEqual(exit_code, 0)
-        worker.assert_not_called()
-        message = self.project.git("show", "-s", "--format=%B", "HEAD").stdout
-        self.assertIn("LoopSail-Task: TASK-001", message)
-        committed_lessons = self.project.git("show", f"HEAD:{loopsail.LESSONS_FILE}").stdout
-        self.assertIn("中断后恢复成功", committed_lessons)
-
-    def test_worker_task_input_mutation_blocks_even_though_input_is_gitignored(self) -> None:
-        def mutating_worker(
-            root: Path,
-            task_file: Path,
-            task_value: dict[str, object],
-            task_state: dict[str, object],
-            config: dict[str, object],
-        ) -> tuple[dict[str, object], dict[str, object]]:
-            task_file.write_text("{}\n", encoding="utf-8")
-            return (
-                {
-                    "task_id": "TASK-001",
-                    "status": "completed",
-                    "summary": "changed control input",
-                    "changed_files": [],
-                    "verification_results": [],
-                    "lessons": [],
-                    "blocker": None,
-                },
-                {"exit_code": 0, "duration_seconds": 0.01},
-            )
-
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
-        with mock.patch.object(loopsail, "invoke_worker", side_effect=mutating_worker):
-            with contextlib.redirect_stdout(io.StringIO()):
-                exit_code = loopsail.command_run(args)
-        self.assertEqual(exit_code, 2)
-        state = loopsail.load_json(self.project.root / ".loopsail" / "runs" / "test-run" / "state.json")
-        self.assertEqual(state["project_status"], "blocked")
-        self.assertIn("protected task-list", state["tasks"]["TASK-001"]["last_failure"]["summary"])
-
-    def test_human_retry_resets_only_a_blocked_task(self) -> None:
-        old_cwd = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, old_cwd)
-        task_file, normalized = loopsail.load_task_input(self.task_file, self.project.root)
-        state = loopsail.create_state(normalized, task_file, self.project.root)
-        item = state["tasks"]["TASK-001"]
-        item.update(
-            {
-                "status": "blocked",
-                "attempts": 3,
-                "last_failure": {"summary": "failure", "fingerprint": "tree"},
-            }
-        )
-        state["active_task"] = "TASK-001"
-        state["project_status"] = "blocked"
-        state_path, _, _ = loopsail.state_paths(self.project.root, "test-run")
-        loopsail.atomic_write_json(state_path, state)
-        args = argparse.Namespace(
-            task_list=self.task_file,
-            task_id="TASK-001",
-            reason="environment fixed",
-        )
+    def test_agent_binding_guard_and_other_agents(self) -> None:
+        self.prepare()
+        request_path = self.project.state()["active_request"]["request_path"]
+        self.project.start_agent()
+        allowed = {
+            "agent_type": "loopsail:worker",
+            "agent_id": "agent-1",
+            "cwd": str(self.project.root),
+            "tool_name": "Read",
+            "tool_input": {"file_path": str(self.project.root / request_path)},
+        }
         with contextlib.redirect_stdout(io.StringIO()):
-            exit_code = loopsail.command_retry(args)
-        self.assertEqual(exit_code, 0)
-        updated = loopsail.load_json(state_path)
-        self.assertEqual(updated["tasks"]["TASK-001"]["status"], "pending")
-        self.assertEqual(updated["tasks"]["TASK-001"]["attempts"], 0)
-        self.assertEqual(updated["tasks"]["TASK-001"]["attempt_sequence"], 3)
-        self.assertEqual(
-            updated["tasks"]["TASK-001"]["last_failure"],
-            {"summary": "failure", "fingerprint": "tree"},
-        )
-        self.assertEqual(updated["project_status"], "executing")
+            self.assertEqual(hook.pre_tool_use(allowed), 0)
 
-
-class RetryActorTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.project = TemporaryGitProject()
-        self.addCleanup(self.project.close)
-        self.task_file = self.project.root / "TASKS.json"
-        write_json(self.task_file, task_list(task("TASK-001")))
-        previous = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, previous)
-
-    def write_blocked_state(self, *, ai_retry_count: int | None = 0) -> Path:
-        task_file, normalized = loopsail.load_task_input(self.task_file, self.project.root)
-        state = loopsail.create_state(normalized, task_file, self.project.root)
-        item = state["tasks"]["TASK-001"]
-        item.update(
-            {
-                "status": "blocked",
-                "attempts": 3,
-                "attempt_sequence": 3,
-                "last_failure": {
-                    "summary": "transient failure",
-                    "fingerprint": "tree",
-                    "recorded_at": loopsail.utc_now(),
-                },
-            }
-        )
-        if ai_retry_count is None:
-            item.pop("ai_retry_count", None)
-        else:
-            item["ai_retry_count"] = ai_retry_count
-        state["active_task"] = "TASK-001"
-        state["project_status"] = "blocked"
-        state_path, _, _ = loopsail.state_paths(self.project.root, "test-run")
-        loopsail.atomic_write_json(state_path, state)
-        return state_path
-
-    def call_retry(self, actor: str) -> int:
-        args = argparse.Namespace(
-            task_list=self.task_file,
-            task_id="TASK-001",
-            reason="environment recovered",
-            actor=actor,
-        )
-        with contextlib.redirect_stdout(io.StringIO()):
-            return loopsail.command_retry(args)
-
-    def test_ai_retry_succeeds_once_and_second_request_is_rejected(self) -> None:
-        state_path = self.write_blocked_state()
-
-        self.assertEqual(self.call_retry("ai"), 0)
-        updated = loopsail.load_json(state_path)
-        item = updated["tasks"]["TASK-001"]
-        self.assertEqual(item["status"], "pending")
-        self.assertEqual(item["attempts"], 0)
-        self.assertEqual(item["attempt_sequence"], 3)
-        self.assertEqual(item["ai_retry_count"], 1)
-        self.assertEqual(item["last_failure"]["summary"], "transient failure")
-        retry_log = loopsail.load_json(
-            self.project.root
-            / ".loopsail"
-            / "logs"
-            / "test-run"
-            / "TASK-001-attempt-0.json"
-        )
-        self.assertEqual(retry_log["status"], "ai-retry")
-        self.assertEqual(retry_log["actor"], "ai")
-        self.assertEqual(retry_log["ai_retry_count"], 1)
-
-        item["status"] = "blocked"
-        item["last_failure"] = {
-            "summary": "failed again",
-            "fingerprint": "tree-2",
-            "recorded_at": loopsail.utc_now(),
-        }
-        updated["active_task"] = "TASK-001"
-        updated["project_status"] = "blocked"
-        loopsail.atomic_write_json(state_path, updated)
-
-        with self.assertRaisesRegex(loopsail.LoopSailError, "AI retry limit"):
-            self.call_retry("ai")
-        rejected = loopsail.load_json(state_path)
-        self.assertEqual(rejected["tasks"]["TASK-001"]["status"], "blocked")
-        self.assertEqual(rejected["tasks"]["TASK-001"]["ai_retry_count"], 1)
-
-    def test_human_retry_resets_ai_quota(self) -> None:
-        state_path = self.write_blocked_state(ai_retry_count=1)
-
-        self.assertEqual(self.call_retry("human"), 0)
-
-        updated = loopsail.load_json(state_path)
-        self.assertEqual(updated["tasks"]["TASK-001"]["status"], "pending")
-        self.assertEqual(updated["tasks"]["TASK-001"]["ai_retry_count"], 0)
-        self.assertEqual(
-            updated["tasks"]["TASK-001"]["last_failure"]["summary"],
-            "transient failure",
-        )
-        retry_log = loopsail.load_json(
-            self.project.root
-            / ".loopsail"
-            / "logs"
-            / "test-run"
-            / "TASK-001-attempt-0.json"
-        )
-        self.assertEqual(retry_log["status"], "human-retry")
-        self.assertEqual(retry_log["actor"], "human")
-        self.assertEqual(retry_log["ai_retry_count"], 0)
-
-    def test_old_state_without_ai_retry_count_is_treated_as_zero(self) -> None:
-        state_path = self.write_blocked_state(ai_retry_count=None)
-
-        self.assertEqual(self.call_retry("ai"), 0)
-
-        updated = loopsail.load_json(state_path)
-        self.assertEqual(updated["tasks"]["TASK-001"]["ai_retry_count"], 1)
-
-
-class StatusTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.project = TemporaryGitProject()
-        self.addCleanup(self.project.close)
-        self.task_file = self.project.root / "TASKS.json"
-        write_json(self.task_file, task_list(task("TASK-001")))
-        previous = Path.cwd()
-        os.chdir(self.project.root)
-        self.addCleanup(os.chdir, previous)
-
-    def test_blocked_status_includes_supervisor_diagnostics(self) -> None:
-        task_file, normalized = loopsail.load_task_input(self.task_file, self.project.root)
-        state = loopsail.create_state(normalized, task_file, self.project.root)
-        failure = {
-            "summary": "verification failed",
-            "fingerprint": "tree",
-            "recorded_at": loopsail.utc_now(),
-        }
-        final_verification = {
-            "status": "failed",
-            "commands": [],
-            "failure": "final verification failed",
-            "at": loopsail.utc_now(),
-        }
-        state["tasks"]["TASK-001"].update(
-            {
-                "status": "blocked",
-                "attempts": 2,
-                "last_failure": failure,
-                "ai_retry_count": 1,
-            }
-        )
-        state["active_task"] = "TASK-001"
-        state["project_status"] = "blocked"
-        state["final_verification"] = final_verification
-        state_path, _, _ = loopsail.state_paths(self.project.root, "test-run")
-        loopsail.atomic_write_json(state_path, state)
-
+        denied = {**allowed, "tool_input": {
+            "file_path": str(self.project.root / ".loopsail/runs/test-list/state.json")
+        }}
         output = io.StringIO()
-        args = argparse.Namespace(task_list=self.task_file, runner_config=None)
         with contextlib.redirect_stdout(output):
-            self.assertEqual(loopsail.command_status(args), 0)
-        status = json.loads(output.getvalue())
+            self.assertEqual(hook.pre_tool_use(denied), 0)
+        self.assertEqual(
+            json.loads(output.getvalue())["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
 
-        self.assertEqual(status["active_task"], "TASK-001")
-        self.assertEqual(status["final_verification"], final_verification)
-        self.assertEqual(status["tasks"][0]["last_failure"], "verification failed")
-        self.assertEqual(status["tasks"][0]["ai_retry_count"], 1)
+        wrong = {**allowed, "agent_id": "wrong"}
+        with self.assertRaises(hook.HookError):
+            hook.pre_tool_use(wrong)
+        self.assertIn(
+            "binding failure",
+            self.project.state()["active_request"]["fatal_error"],
+        )
+
+        other = {**allowed, "agent_type": "general-purpose", "agent_id": "other"}
+        self.assertEqual(hook.pre_tool_use(other), 0)
+
+    def test_events_are_sanitized_and_truncated_once(self) -> None:
+        self.prepare()
+        state_path = self.project.root / ".loopsail/runs/test-list/state.json"
+        state = self.project.state()
+        state["active_request"]["event_log_max_bytes"] = 1
+        write_json(state_path, state)
+        self.project.start_agent()
+        payload = {
+            "agent_type": "loopsail:worker",
+            "agent_id": "agent-1",
+            "cwd": str(self.project.root),
+            "tool_name": "Bash",
+            "tool_input": {"command": "git diff -- secret-token-value"},
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            hook.pre_tool_use(payload)
+            hook.post_tool(payload, "PostToolUse")
+        lease = self.project.state()["active_request"]
+        text = (self.project.root / lease["event_log_path"]).read_text(encoding="utf-8")
+        events = [json.loads(line) for line in text.splitlines()]
+        self.assertEqual(sum(e["hook_event"] == "log_truncated" for e in events), 1)
+        self.assertNotIn("git diff", text)
+        self.assertNotIn("secret-token-value", text)
+        self.assertTrue(all("tool_output" not in event for event in events))
+
+    def test_invalid_result_gets_one_correction_then_protocol_block(self) -> None:
+        self.prepare()
+        self.project.start_agent()
+        first = self.project.stop_agent("not json")
+        decision = json.loads(first)
+        self.assertEqual(decision["decision"], "block")
+        self.assertIn("worker-result v2", decision["reason"])
+
+        second = self.project.stop_agent("still not json", stop_hook_active=True)
+        self.assertEqual(second, "")
+        lease = self.project.state()["active_request"]
+        captured = json.loads(
+            (self.project.root / lease["output_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(captured["status"], "blocked")
+        self.assertTrue(lease["protocol_failure"])
+
+        code, envelope, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "worker_protocol_failure")
+
+
+class RetryAndStateTests(ProjectTestCase):
+    def block_worker(self) -> None:
+        self.prepare()
+        self.project.start_agent()
+        self.project.stop_agent(
+            self.project.worker_result(status="blocked", blocker="transient")
+        )
+        code, _, _ = self.project.call("slash", "finalize-step")
+        self.assertEqual(code, 2)
+
+    def test_ai_retry_once_and_human_retry_resets_quota(self) -> None:
+        self.block_worker()
+        code, envelope, _ = self.project.call(
+            "retry", "TASKS.json", "T-001", "--reason", "transient", "--actor", "ai"
+        )
+        self.assertEqual(code, 0, envelope)
+        self.assertEqual(envelope["data"]["ai_retry_count"], 1)
+
+        self.block_worker()
+        code, envelope, _ = self.project.call(
+            "retry", "TASKS.json", "T-001", "--reason", "again", "--actor", "ai"
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("AI retry limit", envelope["error"]["message"])
+
+        code, envelope, _ = self.project.call(
+            "retry", "TASKS.json", "T-001", "--reason", "confirmed", "--actor", "human"
+        )
+        self.assertEqual(code, 0, envelope)
+        self.assertEqual(envelope["data"]["ai_retry_count"], 0)
+
+    def test_corrupt_state_extra_field_is_rejected(self) -> None:
+        self.prepare()
+        state_path = self.project.root / ".loopsail/runs/test-list/state.json"
+        state = self.project.state()
+        state["unexpected"] = True
+        write_json(state_path, state)
+        code, envelope, _ = self.project.call("slash", "status")
+        self.assertEqual(code, 2)
+        self.assertEqual(envelope["error"]["code"], "invalid_run_state")
+
+    def test_config_layers_require_v2_and_replace_arrays(self) -> None:
+        user = self.project.home / ".loopsail/config.json"
+        project = self.project.root / ".loopsail/config.json"
+        write_json(
+            user,
+            {
+                "schema_version": 2,
+                "kind": "loopsail-config",
+                "protected_paths": ["user/**"],
+            },
+        )
+        write_json(
+            project,
+            {
+                "schema_version": 2,
+                "kind": "loopsail-config",
+                "protected_paths": ["project/**"],
+                "event_log_max_bytes": 1234,
+            },
+        )
+        with mock.patch.dict(os.environ, {"HOME": str(self.project.home)}, clear=False):
+            config, sources = loopsail.load_config(self.project.root)
+        self.assertEqual(config["protected_paths"], ["project/**"])
+        self.assertEqual(config["event_log_max_bytes"], 1234)
+        self.assertEqual(len(sources), 3)
+
+    def test_project_lock_remains_as_one_persistent_inode(self) -> None:
+        lock_path = self.project.root / ".loopsail/lock"
+        lock_path.parent.mkdir(exist_ok=True)
+        with loopsail.project_lock(self.project.root):
+            inode = lock_path.stat().st_ino
+            with self.assertRaises(loopsail.LoopSailError):
+                with loopsail.project_lock(self.project.root):
+                    pass
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(lock_path.stat().st_ino, inode)
+
+
+class InitTests(unittest.TestCase):
+    def test_init_is_idempotent_and_adds_v2_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            (root / "README.md").write_text("# seed\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-m", "seed"], cwd=root, check=True, capture_output=True)
+            home = root / "home"
+            home.mkdir()
+            def invoke() -> dict[str, object]:
+                out = io.StringIO()
+                with cwd(root), mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False), contextlib.redirect_stdout(out):
+                    self.assertEqual(loopsail.main(["init"]), 0)
+                return json.loads(out.getvalue())
+            first = invoke()
+            second = invoke()
+            self.assertIn("TASKS.json", first["data"]["created"])
+            self.assertIn("TASKS.json", second["data"]["preserved"])
+            tasks = json.loads((root / "TASKS.json").read_text(encoding="utf-8"))
+            self.assertEqual(tasks["schema_version"], 2)
+            self.assertEqual(tasks["kind"], "task-list")
+            ignore = (root / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn(".loopsail/output/", ignore)
+
+    def test_unsafe_symlink_fails_before_partial_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run(["git", "init", "-b", "main"], cwd=root, check=True, capture_output=True)
+            outside = root.parent / f"{root.name}-outside"
+            outside.write_text("keep\n", encoding="utf-8")
+            (root / "CLAUDE.md").symlink_to(outside)
+            self.addCleanup(outside.unlink)
+            with self.assertRaises(loopsail.LoopSailError):
+                loopsail.initialize_scaffold(root)
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse((root / "LOOP.md").exists())
 
 
 if __name__ == "__main__":

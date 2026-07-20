@@ -1,0 +1,68 @@
+{
+  "description": "Bind, guard, audit, and capture loopsail:worker subagents.",
+  "hooks": {
+    "SubagentStart": [
+      {
+        "matcher": "^loopsail:worker$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/hook.py\" subagent-start",
+            "timeout": 10,
+            "statusMessage": "Binding LoopSail worker request"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|Glob|Grep|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/hook.py\" pre-tool-use",
+            "timeout": 10,
+            "statusMessage": "Checking LoopSail worker policy"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|Edit|Write|Glob|Grep|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/hook.py\" post-tool-use",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Read|Edit|Write|Glob|Grep|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/hook.py\" post-tool-use-failure",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "^loopsail:worker$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/skills/loopsail/scripts/hook.py\" subagent-stop",
+            "timeout": 10,
+            "statusMessage": "Validating LoopSail worker result"
+          }
+        ]
+      }
+    ]
+  }
+}
